@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.1.1
+ * Version: 1.2.0
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.1.1';
+    const VERSION = '1.2.0';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -126,6 +126,31 @@ final class Surface_Operations_Console {
         ];
     }
 
+    private static function role_permissions() {
+        return [
+            'operations_director' => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','support','reports','teams','staff','audit'],
+            'operations_manager'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','support','reports','teams','staff'],
+            'team_lead'           => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','support','reports','teams'],
+            'operations_officer'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','support'],
+            'finance_officer'     => ['dashboard','tasks','wallet','bundles','reports'],
+            'compliance_officer'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','audit'],
+            'support_officer'     => ['dashboard','tasks','partners','support'],
+            'auditor'             => ['dashboard','reports','audit'],
+        ];
+    }
+
+    private static function can_access($section, $user_id = 0) {
+        if (!$user_id) $user_id = get_current_user_id();
+        $map = self::role_permissions();
+        $level = self::user_level($user_id);
+        return in_array($section, $map[$level] ?? ['dashboard'], true);
+    }
+
+    private static function staff_status($user_id) {
+        $status = sanitize_key((string) get_user_meta($user_id, 'surface_operations_status', true));
+        return $status ?: 'active';
+    }
+
     public static function register_admin_menu() {
         add_menu_page(
             'Surface Operations',
@@ -143,7 +168,6 @@ final class Surface_Operations_Console {
 
         if (isset($_POST['surface_create_staff'])) {
             check_admin_referer('surface_create_staff_action', 'surface_create_staff_nonce');
-
             $name  = sanitize_text_field(wp_unslash($_POST['surface_staff_name'] ?? ''));
             $email = sanitize_email(wp_unslash($_POST['surface_staff_email'] ?? ''));
             $team  = sanitize_text_field(wp_unslash($_POST['surface_staff_team'] ?? 'Operations'));
@@ -152,88 +176,136 @@ final class Surface_Operations_Console {
 
             if (!$name || !is_email($email)) {
                 add_settings_error('surface_operations', 'invalid_staff', 'Enter a valid staff name and email.', 'error');
-                return;
-            }
-
-            if (email_exists($email)) {
+            } elseif (email_exists($email)) {
                 add_settings_error('surface_operations', 'staff_exists', 'That email already belongs to an account.', 'error');
-                return;
+            } else {
+                $user_id = wp_create_user($email, wp_generate_password(32, true, true), $email);
+                if (is_wp_error($user_id)) {
+                    add_settings_error('surface_operations', 'staff_failed', $user_id->get_error_message(), 'error');
+                } else {
+                    wp_update_user(['ID' => $user_id, 'display_name' => $name]);
+                    $user = new WP_User($user_id);
+                    $user->set_role(self::ROLE);
+                    update_user_meta($user_id, 'surface_operations_team', $team);
+                    update_user_meta($user_id, 'surface_operations_level', $level);
+                    update_user_meta($user_id, 'surface_operations_manager_id', $manager_id);
+                    update_user_meta($user_id, 'surface_operations_status', 'active');
+                    update_user_meta($user_id, 'surface_operations_created_at', current_time('mysql'));
+                    wp_mail($email, 'Your Surface Operations Access', "Hello {$name},\n\nYou now have access to Surface Operations.\n\nTeam: {$team}\nRole: " . self::level_label($level) . "\n\nSign in: " . home_url('/' . self::LOGIN_SLUG . '/') . "\n\nSurface Internet");
+                    self::audit('staff.created', 'staff', (string) $user_id, "Created staff access for {$name}");
+                    add_settings_error('surface_operations', 'staff_created', 'Staff access created and emailed.', 'success');
+                }
             }
+        }
 
-            $password = wp_generate_password(32, true, true);
-            $user_id = wp_create_user($email, $password, $email);
-
-            if (is_wp_error($user_id)) {
-                add_settings_error('surface_operations', 'staff_failed', $user_id->get_error_message(), 'error');
-                return;
+        if (isset($_POST['surface_update_staff'])) {
+            check_admin_referer('surface_update_staff_action', 'surface_update_staff_nonce');
+            $user_id = absint($_POST['surface_staff_id'] ?? 0);
+            $user = get_user_by('id', $user_id);
+            if ($user && self::is_staff($user)) {
+                $name = sanitize_text_field(wp_unslash($_POST['surface_staff_name'] ?? $user->display_name));
+                $team = sanitize_text_field(wp_unslash($_POST['surface_staff_team'] ?? 'Operations'));
+                $level = sanitize_key(wp_unslash($_POST['surface_staff_level'] ?? 'operations_officer'));
+                $manager_id = absint($_POST['surface_staff_manager'] ?? 0);
+                wp_update_user(['ID' => $user_id, 'display_name' => $name]);
+                update_user_meta($user_id, 'surface_operations_team', $team);
+                update_user_meta($user_id, 'surface_operations_level', $level);
+                update_user_meta($user_id, 'surface_operations_manager_id', $manager_id);
+                self::audit('staff.updated', 'staff', (string) $user_id, "Updated staff profile for {$name}");
+                add_settings_error('surface_operations', 'staff_updated', 'Staff profile updated.', 'success');
             }
+        }
 
-            wp_update_user(['ID' => $user_id, 'display_name' => $name]);
-            $user = new WP_User($user_id);
-            $user->set_role(self::ROLE);
+        if (isset($_POST['surface_toggle_staff'])) {
+            check_admin_referer('surface_toggle_staff_action', 'surface_toggle_staff_nonce');
+            $user_id = absint($_POST['surface_staff_id'] ?? 0);
+            $user = get_user_by('id', $user_id);
+            if ($user && self::is_staff($user)) {
+                $new_status = self::staff_status($user_id) === 'suspended' ? 'active' : 'suspended';
+                update_user_meta($user_id, 'surface_operations_status', $new_status);
+                delete_transient(self::otp_key($user->user_email));
+                self::audit('staff.' . $new_status, 'staff', (string) $user_id, ucfirst($new_status) . " staff access for {$user->display_name}");
+                add_settings_error('surface_operations', 'staff_status', 'Staff status updated.', 'success');
+            }
+        }
 
-            update_user_meta($user_id, 'surface_operations_team', $team);
-            update_user_meta($user_id, 'surface_operations_level', $level);
-            update_user_meta($user_id, 'surface_operations_manager_id', $manager_id);
-            update_user_meta($user_id, 'surface_operations_status', 'active');
-
-            $subject = 'Your Surface Operations Access';
-            $message  = "Hello {$name},\n\n";
-            $message .= "You have been granted access to the Surface Operations Console.\n\n";
-            $message .= "Team: {$team}\n";
-            $message .= "Role: " . self::level_label($level) . "\n\n";
-            $message .= "Sign in with the one-time code sent to your email whenever you need access:\n";
-            $message .= home_url('/' . self::LOGIN_SLUG . '/') . "\n\n";
-            $message .= "Surface Internet\nThe Internet for a changing world";
-            wp_mail($email, $subject, $message);
-
-            self::audit('staff.created', 'staff', (string) $user_id, "Created staff access for {$name}");
-            add_settings_error('surface_operations', 'staff_created', 'Staff access created. The staff member has been emailed.', 'success');
+        if (isset($_POST['surface_delete_staff'])) {
+            check_admin_referer('surface_delete_staff_action', 'surface_delete_staff_nonce');
+            $user_id = absint($_POST['surface_staff_id'] ?? 0);
+            $user = get_user_by('id', $user_id);
+            if ($user && self::is_staff($user)) {
+                $name = $user->display_name;
+                require_once ABSPATH . 'wp-admin/includes/user.php';
+                wp_delete_user($user_id);
+                self::audit('staff.deleted', 'staff', (string) $user_id, "Deleted staff account for {$name}");
+                add_settings_error('surface_operations', 'staff_deleted', 'Staff account deleted.', 'success');
+            }
         }
     }
 
     public static function render_admin_page() {
         if (!current_user_can('manage_options')) return;
-        $staff = get_users(['role' => self::ROLE, 'orderby' => 'display_name', 'order' => 'ASC']);
+        $search = sanitize_text_field(wp_unslash($_GET['staff_search'] ?? ''));
+        $args = ['role' => self::ROLE, 'orderby' => 'display_name', 'order' => 'ASC'];
+        if ($search) $args['search'] = '*' . $search . '*';
+        $staff = get_users($args);
+        $all_staff = get_users(['role' => self::ROLE, 'orderby' => 'display_name', 'order' => 'ASC']);
+        $edit_id = absint($_GET['edit_staff'] ?? 0);
+        $edit_user = $edit_id ? get_user_by('id', $edit_id) : null;
+        if ($edit_user && !self::is_staff($edit_user)) $edit_user = null;
+        $active = 0; $suspended = 0;
+        foreach ($all_staff as $member) self::staff_status($member->ID) === 'suspended' ? $suspended++ : $active++;
         settings_errors('surface_operations');
         ?>
         <div class="wrap">
             <h1>Surface Operations</h1>
-            <p>Provision and organise access to the Surface Operations Console.</p>
+            <p>Manage staff access, hierarchy, teams and operational responsibility.</p>
+            <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;max-width:900px;margin:18px 0 24px;">
+                <div style="background:#fff;border:1px solid #dcdcde;border-radius:12px;padding:18px;"><small>Total Staff</small><strong style="display:block;font-size:28px;margin-top:6px;"><?php echo esc_html(count($all_staff)); ?></strong></div>
+                <div style="background:#fff;border:1px solid #dcdcde;border-radius:12px;padding:18px;"><small>Active</small><strong style="display:block;font-size:28px;margin-top:6px;"><?php echo esc_html($active); ?></strong></div>
+                <div style="background:#fff;border:1px solid #dcdcde;border-radius:12px;padding:18px;"><small>Suspended</small><strong style="display:block;font-size:28px;margin-top:6px;"><?php echo esc_html($suspended); ?></strong></div>
+            </div>
 
-            <div style="display:grid;grid-template-columns:minmax(320px,520px) minmax(420px,1fr);gap:28px;align-items:start;">
+            <div style="display:grid;grid-template-columns:minmax(340px,520px) minmax(560px,1fr);gap:26px;align-items:start;">
                 <div style="background:#fff;border:1px solid #dcdcde;border-radius:12px;padding:22px;">
-                    <h2 style="margin-top:0;">Create Staff Access</h2>
+                    <h2 style="margin-top:0;"><?php echo $edit_user ? 'Edit Staff Member' : 'Create Staff Access'; ?></h2>
                     <form method="post">
-                        <?php wp_nonce_field('surface_create_staff_action', 'surface_create_staff_nonce'); ?>
-                        <p><label><strong>Full Name</strong><br><input type="text" name="surface_staff_name" class="regular-text" required></label></p>
-                        <p><label><strong>Email</strong><br><input type="email" name="surface_staff_email" class="regular-text" required></label></p>
+                        <?php if ($edit_user): wp_nonce_field('surface_update_staff_action', 'surface_update_staff_nonce'); ?>
+                            <input type="hidden" name="surface_staff_id" value="<?php echo esc_attr($edit_user->ID); ?>">
+                        <?php else: wp_nonce_field('surface_create_staff_action', 'surface_create_staff_nonce'); endif; ?>
+                        <p><label><strong>Full Name</strong><br><input type="text" name="surface_staff_name" class="regular-text" value="<?php echo esc_attr($edit_user ? $edit_user->display_name : ''); ?>" required></label></p>
+                        <p><label><strong>Email</strong><br><input type="email" name="surface_staff_email" class="regular-text" value="<?php echo esc_attr($edit_user ? $edit_user->user_email : ''); ?>" <?php echo $edit_user ? 'readonly' : 'required'; ?>></label></p>
                         <p><label><strong>Team</strong><br><select name="surface_staff_team" class="regular-text">
-                            <?php foreach (self::teams() as $team): ?><option value="<?php echo esc_attr($team); ?>"><?php echo esc_html($team); ?></option><?php endforeach; ?>
+                            <?php $current_team = $edit_user ? self::user_team($edit_user->ID) : 'Operations'; foreach (self::teams() as $team): ?><option value="<?php echo esc_attr($team); ?>" <?php selected($current_team, $team); ?>><?php echo esc_html($team); ?></option><?php endforeach; ?>
                         </select></label></p>
                         <p><label><strong>Role</strong><br><select name="surface_staff_level" class="regular-text">
-                            <?php foreach (self::levels() as $key => $label): ?><option value="<?php echo esc_attr($key); ?>"><?php echo esc_html($label); ?></option><?php endforeach; ?>
+                            <?php $current_level = $edit_user ? self::user_level($edit_user->ID) : 'operations_officer'; foreach (self::levels() as $key => $label): ?><option value="<?php echo esc_attr($key); ?>" <?php selected($current_level, $key); ?>><?php echo esc_html($label); ?></option><?php endforeach; ?>
                         </select></label></p>
                         <p><label><strong>Reports To</strong><br><select name="surface_staff_manager" class="regular-text"><option value="0">No manager assigned</option>
-                            <?php foreach ($staff as $manager): ?><option value="<?php echo esc_attr($manager->ID); ?>"><?php echo esc_html($manager->display_name); ?></option><?php endforeach; ?>
+                            <?php $current_manager = $edit_user ? absint(get_user_meta($edit_user->ID, 'surface_operations_manager_id', true)) : 0; foreach ($all_staff as $manager): if ($edit_user && $manager->ID === $edit_user->ID) continue; ?><option value="<?php echo esc_attr($manager->ID); ?>" <?php selected($current_manager, $manager->ID); ?>><?php echo esc_html($manager->display_name); ?></option><?php endforeach; ?>
                         </select></label></p>
-                        <p><button type="submit" name="surface_create_staff" class="button button-primary">Create Staff Access</button></p>
+                        <p><button type="submit" name="<?php echo $edit_user ? 'surface_update_staff' : 'surface_create_staff'; ?>" class="button button-primary"><?php echo $edit_user ? 'Save Staff Changes' : 'Create Staff Access'; ?></button><?php if ($edit_user): ?> <a class="button" href="<?php echo esc_url(admin_url('admin.php?page=surface-operations')); ?>">Cancel</a><?php endif; ?></p>
                     </form>
                 </div>
 
-                <div style="background:#fff;border:1px solid #dcdcde;border-radius:12px;padding:22px;">
-                    <h2 style="margin-top:0;">Operations Staff</h2>
+                <div style="background:#fff;border:1px solid #dcdcde;border-radius:12px;padding:22px;overflow:auto;">
+                    <div style="display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:14px;"><h2 style="margin:0;">Staff Centre</h2><form method="get"><input type="hidden" name="page" value="surface-operations"><input type="search" name="staff_search" value="<?php echo esc_attr($search); ?>" placeholder="Search staff"><button class="button">Search</button></form></div>
                     <table class="widefat striped">
-                        <thead><tr><th>Name</th><th>Team</th><th>Role</th><th>Status</th><th>Last Login</th></tr></thead>
+                        <thead><tr><th>Staff</th><th>Team</th><th>Role</th><th>Manager</th><th>Status</th><th>Last Login</th><th>Actions</th></tr></thead>
                         <tbody>
-                        <?php if (!$staff): ?><tr><td colspan="5">No staff accounts yet.</td></tr><?php endif; ?>
-                        <?php foreach ($staff as $member): ?>
+                        <?php if (!$staff): ?><tr><td colspan="7">No matching staff found.</td></tr><?php endif; ?>
+                        <?php foreach ($staff as $member): $manager_id = absint(get_user_meta($member->ID,'surface_operations_manager_id',true)); $manager = $manager_id ? get_user_by('id',$manager_id) : null; $status = self::staff_status($member->ID); ?>
                             <tr>
                                 <td><strong><?php echo esc_html($member->display_name); ?></strong><br><small><?php echo esc_html($member->user_email); ?></small></td>
                                 <td><?php echo esc_html(self::user_team($member->ID) ?: 'Operations'); ?></td>
                                 <td><?php echo esc_html(self::level_label(self::user_level($member->ID))); ?></td>
-                                <td><?php echo esc_html(ucfirst((string) get_user_meta($member->ID, 'surface_operations_status', true) ?: 'Active')); ?></td>
+                                <td><?php echo esc_html($manager ? $manager->display_name : '—'); ?></td>
+                                <td><span style="font-weight:700;color:<?php echo $status === 'suspended' ? '#b91c1c' : '#047857'; ?>"><?php echo esc_html(ucfirst($status)); ?></span></td>
                                 <td><?php echo esc_html((string) get_user_meta($member->ID, 'surface_operations_last_login', true) ?: 'Never'); ?></td>
+                                <td style="white-space:nowrap;"><a class="button button-small" href="<?php echo esc_url(admin_url('admin.php?page=surface-operations&edit_staff=' . $member->ID)); ?>">Edit</a>
+                                    <form method="post" style="display:inline"><?php wp_nonce_field('surface_toggle_staff_action', 'surface_toggle_staff_nonce'); ?><input type="hidden" name="surface_staff_id" value="<?php echo esc_attr($member->ID); ?>"><button class="button button-small" name="surface_toggle_staff"><?php echo $status === 'suspended' ? 'Reactivate' : 'Suspend'; ?></button></form>
+                                    <form method="post" style="display:inline" onsubmit="return confirm('Delete this staff account?');"><?php wp_nonce_field('surface_delete_staff_action', 'surface_delete_staff_nonce'); ?><input type="hidden" name="surface_staff_id" value="<?php echo esc_attr($member->ID); ?>"><button class="button button-small" name="surface_delete_staff">Delete</button></form>
+                                </td>
                             </tr>
                         <?php endforeach; ?>
                         </tbody>
@@ -313,6 +385,10 @@ final class Surface_Operations_Console {
         if (!$user || !self::is_staff($user) || strcasecmp($user->user_email, $email) !== 0) {
             delete_transient(self::otp_key($email));
             return new WP_Error('otp_user_invalid', 'This staff access could not be verified.');
+        }
+        if (self::staff_status($user->ID) === 'suspended') {
+            delete_transient(self::otp_key($email));
+            return new WP_Error('staff_suspended', 'This staff access is currently suspended.');
         }
 
         delete_transient(self::otp_key($email));
@@ -456,6 +532,9 @@ final class Surface_Operations_Console {
         $team = self::user_team($user->ID) ?: 'Operations';
         $level = self::level_label(self::user_level($user->ID));
         $task_counts = self::task_counts($user->ID, $team);
+        $all_staff = get_users(['role' => self::ROLE, 'fields' => 'ID']);
+        $active_staff = 0; $suspended_staff = 0;
+        foreach ($all_staff as $staff_id) self::staff_status($staff_id) === 'suspended' ? $suspended_staff++ : $active_staff++;
         $recent_tasks = self::recent_tasks($user->ID, $team, 6);
         $recent_audit = self::recent_audit(6);
         $logout_url = wp_logout_url(home_url('/' . self::LOGIN_SLUG . '/'));
@@ -469,7 +548,13 @@ final class Surface_Operations_Console {
             <aside class="soc-sidebar">
                 <div class="soc-brand">Surface Operations<small>Operating the Surface Internet</small></div>
                 <nav class="soc-nav">
-                    <a class="active" href="#">Dashboard</a><a href="#tasks">Tasks</a><a href="#partners">Partners</a><a href="#surfaceteeth">SurfaceTeeth™</a><a href="#advocates">Advocates</a><a href="#campaigns">Campaigns</a><a href="#wallet">Wallet</a><a href="#bundles">Bundles</a><a href="#support">Support</a><a href="#reports">Reports</a>
+                    <?php
+                    $nav = ['dashboard'=>'Dashboard','tasks'=>'Tasks','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth™','advocates'=>'Advocates','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','support'=>'Support','reports'=>'Reports','teams'=>'Teams','staff'=>'Staff','audit'=>'Audit'];
+                    foreach ($nav as $key => $label) {
+                        if (!self::can_access($key, $user->ID)) continue;
+                        echo '<a class="' . ($key === 'dashboard' ? 'active' : '') . '" href="#' . esc_attr($key) . '">' . esc_html($label) . '</a>';
+                    }
+                    ?>
                 </nav>
                 <div class="soc-sidebar-foot"><strong><?php echo esc_html($user->display_name); ?></strong><span><?php echo esc_html($level . ' · ' . $team); ?></span><a href="<?php echo esc_url($logout_url); ?>">Sign out</a></div>
             </aside>
@@ -479,8 +564,8 @@ final class Surface_Operations_Console {
                 <section class="soc-grid">
                     <div class="soc-stat"><span>My Open Tasks</span><strong><?php echo esc_html($task_counts['mine']); ?></strong></div>
                     <div class="soc-stat"><span>Team Queue</span><strong><?php echo esc_html($task_counts['team']); ?></strong></div>
-                    <div class="soc-stat"><span>Due Today</span><strong><?php echo esc_html($task_counts['due_today']); ?></strong></div>
-                    <div class="soc-stat"><span>Overdue</span><strong><?php echo esc_html($task_counts['overdue']); ?></strong></div>
+                    <div class="soc-stat"><span>Active Staff</span><strong><?php echo esc_html($active_staff); ?></strong></div>
+                    <div class="soc-stat"><span>Suspended</span><strong><?php echo esc_html($suspended_staff); ?></strong></div>
                 </section>
 
                 <section class="soc-columns">
