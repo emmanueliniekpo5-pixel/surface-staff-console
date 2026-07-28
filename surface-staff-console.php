@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.3.4
+ * Version: 1.3.6
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.3.4';
+    const VERSION = '1.3.6';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -158,6 +158,36 @@ final class Surface_Operations_Console {
         $comments_exists = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $comments));
 
         return $tasks_exists === $tasks && $comments_exists === $comments;
+    }
+
+    private static function ensure_audit_table() {
+        global $wpdb;
+
+        $audit = $wpdb->prefix . 'surface_operations_audit';
+        $exists = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $audit));
+        if ($exists === $audit) return true;
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        $charset = $wpdb->get_charset_collate();
+
+        dbDelta("CREATE TABLE {$audit} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            actor_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            action_key VARCHAR(120) NOT NULL,
+            object_type VARCHAR(80) NULL,
+            object_id VARCHAR(120) NULL,
+            summary TEXT NOT NULL,
+            context LONGTEXT NULL,
+            ip_address VARCHAR(64) NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            KEY actor_user_id (actor_user_id),
+            KEY action_key (action_key),
+            KEY object_type (object_type)
+        ) {$charset};");
+
+        $exists = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $audit));
+        return $exists === $audit;
     }
 
     private static function is_staff($user = null) {
@@ -968,10 +998,20 @@ final class Surface_Operations_Console {
             'team'     => sanitize_text_field(wp_unslash($_GET['task_team'] ?? '')),
             'user_id'  => absint($_GET['task_user_id'] ?? 0),
         ];
+        $audit_filters = [
+            'staff_id'   => absint($_GET['audit_staff_id'] ?? 0),
+            'object_type'=> sanitize_key(wp_unslash($_GET['audit_object_type'] ?? '')),
+            'action_key' => sanitize_key(wp_unslash($_GET['audit_action_key'] ?? '')),
+            'date_from'  => sanitize_text_field(wp_unslash($_GET['audit_date_from'] ?? '')),
+            'date_to'    => sanitize_text_field(wp_unslash($_GET['audit_date_to'] ?? '')),
+            'search'     => sanitize_text_field(wp_unslash($_GET['audit_search'] ?? '')),
+        ];
+        $audit_entries = $section === 'audit' ? self::filtered_audit($audit_filters, 250) : [];
+        $audit_options = $section === 'audit' ? self::audit_filter_options() : ['actions'=>[], 'objects'=>[]];
 
         ob_start(); ?>
         <style>
-        body{background:#f4f6f8!important}.soc-app{min-height:100vh;display:grid;grid-template-columns:250px 1fr;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827}.soc-sidebar{background:#111827;color:#fff;padding:26px 18px;position:sticky;top:0;height:100vh;box-sizing:border-box}.soc-brand{font-size:19px;font-weight:800;padding:0 10px 24px}.soc-brand small{display:block;color:#9ca3af;font-size:11px;font-weight:600;margin-top:4px}.soc-nav a{display:block;color:#cbd5e1;text-decoration:none;padding:11px 12px;border-radius:10px;margin:3px 0;font-size:14px}.soc-nav a:hover,.soc-nav a.active{background:#1f2937;color:#fff}.soc-sidebar-foot{position:absolute;left:18px;right:18px;bottom:22px;border-top:1px solid #374151;padding-top:16px}.soc-sidebar-foot strong,.soc-sidebar-foot span{display:block}.soc-sidebar-foot span{font-size:12px;color:#9ca3af;margin:3px 0 10px}.soc-sidebar-foot a{color:#cbd5e1;font-size:13px}.soc-main{padding:30px}.soc-top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:25px}.soc-top h1{font-size:29px;margin:0 0 4px}.soc-top p{margin:0;color:#6b7280}.soc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.soc-stat,.soc-panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px}.soc-stat{padding:20px}.soc-stat span{display:block;color:#6b7280;font-size:13px}.soc-stat strong{display:block;font-size:30px;margin-top:7px}.soc-columns{display:grid;grid-template-columns:1.25fr .9fr;gap:18px;margin-top:18px}.soc-panel{padding:21px}.soc-panel h2{font-size:17px;margin:0 0 16px}.soc-row{display:flex;justify-content:space-between;gap:14px;padding:13px 0;border-top:1px solid #f0f1f3}.soc-row:first-of-type{border-top:0}.soc-row-title{font-weight:700;font-size:14px}.soc-meta{font-size:12px;color:#6b7280;margin-top:4px}.soc-badge{height:max-content;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:750;background:#f3f4f6}.soc-empty{color:#6b7280;font-size:14px;padding:8px 0}.soc-task-grid{display:grid;grid-template-columns:340px 1fr;gap:18px}.soc-form label{display:block;font-size:12px;font-weight:700;margin:0 0 6px}.soc-form input,.soc-form select,.soc-form textarea{width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:10px;margin:0 0 13px;background:#fff}.soc-form textarea{min-height:90px;resize:vertical}.soc-btn{border:0;border-radius:10px;background:#111827;color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}.soc-btn-light{background:#eef0f3;color:#111827}.soc-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.soc-task{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-task-head{display:flex;justify-content:space-between;gap:12px}.soc-task h3{font-size:15px;margin:0}.soc-task p{font-size:13px;color:#4b5563}.soc-inline{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.soc-inline select,.soc-inline input{margin:0}.soc-alert{padding:12px 14px;border-radius:10px;background:#ecfdf5;color:#065f46;margin-bottom:16px}.soc-comments{margin-top:13px;padding-top:12px;border-top:1px solid #eef0f2}.soc-comment{font-size:12px;padding:7px 0}.soc-comment b{display:block}.soc-overdue{color:#b91c1c;font-weight:700}.soc-filters{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:14px;padding:12px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px}.soc-filters label{font-size:12px;font-weight:700}.soc-filters select{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}@media(max-width:900px){.soc-app{grid-template-columns:1fr}.soc-sidebar{height:auto;position:relative}.soc-sidebar-foot{position:static;margin-top:20px}.soc-main{padding:20px}.soc-grid{grid-template-columns:repeat(2,1fr)}.soc-columns,.soc-task-grid{grid-template-columns:1fr}}@media(max-width:520px){.soc-grid{grid-template-columns:1fr}}
+        body{background:#f4f6f8!important}.soc-app{min-height:100vh;display:grid;grid-template-columns:250px 1fr;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827}.soc-sidebar{background:#111827;color:#fff;padding:26px 18px;position:sticky;top:0;height:100vh;box-sizing:border-box}.soc-brand{font-size:19px;font-weight:800;padding:0 10px 24px}.soc-brand small{display:block;color:#9ca3af;font-size:11px;font-weight:600;margin-top:4px}.soc-nav a{display:block;color:#cbd5e1;text-decoration:none;padding:11px 12px;border-radius:10px;margin:3px 0;font-size:14px}.soc-nav a:hover,.soc-nav a.active{background:#1f2937;color:#fff}.soc-sidebar-foot{position:absolute;left:18px;right:18px;bottom:22px;border-top:1px solid #374151;padding-top:16px}.soc-sidebar-foot strong,.soc-sidebar-foot span{display:block}.soc-sidebar-foot span{font-size:12px;color:#9ca3af;margin:3px 0 10px}.soc-sidebar-foot a{color:#cbd5e1;font-size:13px}.soc-main{padding:30px}.soc-top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:25px}.soc-top h1{font-size:29px;margin:0 0 4px}.soc-top p{margin:0;color:#6b7280}.soc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.soc-stat,.soc-panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px}.soc-stat{padding:20px}.soc-stat span{display:block;color:#6b7280;font-size:13px}.soc-stat strong{display:block;font-size:30px;margin-top:7px}.soc-columns{display:grid;grid-template-columns:1.25fr .9fr;gap:18px;margin-top:18px}.soc-panel{padding:21px}.soc-panel h2{font-size:17px;margin:0 0 16px}.soc-row{display:flex;justify-content:space-between;gap:14px;padding:13px 0;border-top:1px solid #f0f1f3}.soc-row:first-of-type{border-top:0}.soc-row-title{font-weight:700;font-size:14px}.soc-meta{font-size:12px;color:#6b7280;margin-top:4px}.soc-badge{height:max-content;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:750;background:#f3f4f6}.soc-empty{color:#6b7280;font-size:14px;padding:8px 0}.soc-task-grid{display:grid;grid-template-columns:340px 1fr;gap:18px}.soc-form label{display:block;font-size:12px;font-weight:700;margin:0 0 6px}.soc-form input,.soc-form select,.soc-form textarea{width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:10px;margin:0 0 13px;background:#fff}.soc-form textarea{min-height:90px;resize:vertical}.soc-btn{border:0;border-radius:10px;background:#111827;color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}.soc-btn-light{background:#eef0f3;color:#111827}.soc-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.soc-task{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-task-head{display:flex;justify-content:space-between;gap:12px}.soc-task h3{font-size:15px;margin:0}.soc-task p{font-size:13px;color:#4b5563}.soc-inline{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.soc-inline select,.soc-inline input{margin:0}.soc-alert{padding:12px 14px;border-radius:10px;background:#ecfdf5;color:#065f46;margin-bottom:16px}.soc-comments{margin-top:13px;padding-top:12px;border-top:1px solid #eef0f2}.soc-comment{font-size:12px;padding:7px 0}.soc-comment b{display:block}.soc-overdue{color:#b91c1c;font-weight:700}.soc-filters{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:14px;padding:12px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px}.soc-filters label{font-size:12px;font-weight:700}.soc-filters select{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-filters input{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-audit-item{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-audit-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.soc-audit-summary{font-weight:750;font-size:14px}.soc-audit-details{margin-top:12px;padding-top:12px;border-top:1px solid #eef0f2;font-size:12px;color:#4b5563}.soc-audit-details code{display:block;white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:10px;border-radius:8px;margin-top:8px}.soc-audit-count{font-size:13px;color:#6b7280;margin-bottom:12px}@media(max-width:900px){.soc-app{grid-template-columns:1fr}.soc-sidebar{height:auto;position:relative}.soc-sidebar-foot{position:static;margin-top:20px}.soc-main{padding:20px}.soc-grid{grid-template-columns:repeat(2,1fr)}.soc-columns,.soc-task-grid{grid-template-columns:1fr}}@media(max-width:520px){.soc-grid{grid-template-columns:1fr}}
         </style>
         <div class="soc-app"><aside class="soc-sidebar"><div class="soc-brand">Surface Operations<small>Operating the Surface Internet</small></div><nav class="soc-nav">
         <?php $nav=['dashboard'=>'Dashboard','tasks'=>'Tasks','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth™','advocates'=>'Advocates','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','support'=>'Support','reports'=>'Reports','teams'=>'Teams','staff'=>'Staff','audit'=>'Audit']; foreach($nav as $key=>$label){if(!self::can_access($key,$user->ID))continue;$url=add_query_arg('soc_section',$key,$base_url);echo '<a class="'.($key===$section?'active':'').'" href="'.esc_url($url).'">'.esc_html($label).'</a>';} ?>
@@ -983,6 +1023,26 @@ final class Surface_Operations_Console {
             <section class="soc-task-grid">
                 <?php if(self::can_manage_tasks($user->ID)): ?><div class="soc-panel"><h2>Assign Task</h2><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="create"><label>Task</label><input name="task_title" required><label>Description</label><textarea name="task_description"></textarea><label>Module</label><select name="task_module"><?php foreach(['general'=>'General','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth','advocacy'=>'Advocacy','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','support'=>'Support'] as $k=>$v)echo '<option value="'.esc_attr($k).'">'.esc_html($v).'</option>'; ?></select><label>Priority</label><select name="task_priority"><option value="low">Low</option><option value="normal" selected>Normal</option><option value="high">High</option><option value="urgent">Urgent</option></select><label>Assign to staff</label><select name="task_user_id"><option value="0">Team queue</option><?php foreach($staff_list as $member){if(self::staff_status($member->ID)==='suspended')continue;echo '<option value="'.esc_attr($member->ID).'">'.esc_html($member->display_name.' · '.self::user_team($member->ID)).'</option>';} ?></select><label>Team</label><select name="task_team"><option value="">Select team</option><?php foreach(self::teams() as $t)echo '<option value="'.esc_attr($t).'">'.esc_html($t).'</option>'; ?></select><label>Due date</label><input type="datetime-local" name="task_due_at"><button class="soc-btn" type="submit">Assign Task</button></form></div><?php endif; ?>
                 <div class="soc-panel"><h2><?php echo self::can_manage_tasks($user->ID)?'Operational Tasks':'My Tasks'; ?></h2><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="tasks"><label>Status<select name="task_status"><option value="all">All</option><option value="open" <?php selected($task_filters['status'],'open'); ?>>Open</option><option value="in_progress" <?php selected($task_filters['status'],'in_progress'); ?>>In Progress</option><option value="completed" <?php selected($task_filters['status'],'completed'); ?>>Completed</option></select></label><label>Priority<select name="task_priority"><option value="all">All</option><?php foreach(['low'=>'Low','normal'=>'Normal','high'=>'High','urgent'=>'Urgent'] as $k=>$v)echo '<option value="'.esc_attr($k).'" '.selected($task_filters['priority'],$k,false).'>'.esc_html($v).'</option>'; ?></select></label><?php if(self::can_manage_tasks($user->ID)): ?><label>Team<select name="task_team"><option value="">All teams</option><?php foreach(self::teams() as $t)echo '<option value="'.esc_attr($t).'" '.selected($task_filters['team'],$t,false).'>'.esc_html($t).'</option>'; ?></select></label><label>Staff<select name="task_user_id"><option value="0">All staff</option><?php foreach($staff_list as $member)echo '<option value="'.esc_attr($member->ID).'" '.selected($task_filters['user_id'],$member->ID,false).'>'.esc_html($member->display_name).'</option>'; ?></select></label><?php endif; ?><button class="soc-btn soc-btn-light" type="submit">Filter</button><a class="soc-btn soc-btn-light" style="text-decoration:none" href="<?php echo esc_url(add_query_arg('soc_section','tasks',$base_url)); ?>">Reset</a></form><?php $tasks=self::visible_tasks($user->ID,$team,self::can_manage_tasks($user->ID),$task_filters); if(!$tasks): ?><div class="soc-empty">No tasks found.</div><?php endif; ?><?php foreach($tasks as $task): $comments=self::task_comments($task->id); ?><article class="soc-task"><div class="soc-task-head"><div><h3><?php echo esc_html($task->title); ?></h3><div class="soc-meta"><?php echo esc_html(ucfirst($task->module).' · '.ucwords(str_replace('_',' ',$task->status)).' · '.ucfirst($task->priority)); ?><?php if($task->due_at): ?> · <span class="<?php echo ($task->status!=='completed' && strtotime($task->due_at)<current_time('timestamp'))?'soc-overdue':''; ?>">Due <?php echo esc_html(mysql2date('M j, g:i a',$task->due_at)); ?></span><?php endif; ?></div></div><span class="soc-badge"><?php echo esc_html($task->assigned_user_id?self::staff_name($task->assigned_user_id):($task->assigned_team?:'Unassigned')); ?></span></div><?php if($task->description): ?><p><?php echo nl2br(esc_html($task->description)); ?></p><?php endif; ?><div class="soc-actions"><?php if(self::can_manage_tasks($user->ID)): ?><form class="soc-inline" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="reassign"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><select name="task_user_id"><option value="0">Team queue</option><?php foreach($staff_list as $member){if(self::staff_status($member->ID)==='suspended')continue;echo '<option value="'.esc_attr($member->ID).'" '.selected((int)$task->assigned_user_id,$member->ID,false).'>'.esc_html($member->display_name).'</option>';} ?></select><select name="task_team"><option value="">No team</option><?php foreach(self::teams() as $t)echo '<option value="'.esc_attr($t).'" '.selected((string)$task->assigned_team,$t,false).'>'.esc_html($t).'</option>'; ?></select><button class="soc-btn soc-btn-light" type="submit">Reassign</button></form><?php endif; ?><?php if(!$task->assigned_user_id && $task->assigned_team===$team): ?><form method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="claim"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><button class="soc-btn" type="submit">Claim</button></form><?php endif; ?><form class="soc-inline" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="status"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><select name="task_status"><option value="open" <?php selected($task->status,'open'); ?>>Open</option><option value="in_progress" <?php selected($task->status,'in_progress'); ?>>In Progress</option><option value="completed" <?php selected($task->status,'completed'); ?>>Completed</option></select><button class="soc-btn soc-btn-light" type="submit">Update</button></form></div><div class="soc-comments"><?php foreach($comments as $comment): ?><div class="soc-comment"><b><?php echo esc_html(self::staff_name($comment->user_id)); ?></b><?php echo esc_html($comment->comment_text); ?> <span class="soc-meta"><?php echo esc_html(mysql2date('M j, g:i a',$comment->created_at)); ?></span></div><?php endforeach; ?><form class="soc-inline" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="comment"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><input type="text" name="task_comment" placeholder="Add internal comment" required><button class="soc-btn soc-btn-light" type="submit">Comment</button></form></div></article><?php endforeach; ?></div>
+            </section>
+        <?php elseif($section==='audit'): ?>
+            <div class="soc-top"><div><h1>Audit Centre</h1><p>Review who did what, where and when across Surface Operations.</p></div></div>
+            <section class="soc-panel">
+                <form class="soc-filters" method="get">
+                    <input type="hidden" name="soc_section" value="audit">
+                    <label>Staff<select name="audit_staff_id"><option value="0">All staff</option><?php foreach($staff_list as $member): ?><option value="<?php echo esc_attr($member->ID); ?>" <?php selected($audit_filters['staff_id'],$member->ID); ?>><?php echo esc_html($member->display_name); ?></option><?php endforeach; ?></select></label>
+                    <label>Module<select name="audit_object_type"><option value="">All modules</option><?php foreach($audit_options['objects'] as $object): ?><option value="<?php echo esc_attr($object); ?>" <?php selected($audit_filters['object_type'],$object); ?>><?php echo esc_html(ucwords(str_replace(['_','-'],' ',$object))); ?></option><?php endforeach; ?></select></label>
+                    <label>Action<select name="audit_action_key"><option value="">All actions</option><?php foreach($audit_options['actions'] as $action): ?><option value="<?php echo esc_attr($action); ?>" <?php selected($audit_filters['action_key'],$action); ?>><?php echo esc_html(ucwords(str_replace(['.','_','-'],' ',$action))); ?></option><?php endforeach; ?></select></label>
+                    <label>From<input type="date" name="audit_date_from" value="<?php echo esc_attr($audit_filters['date_from']); ?>"></label>
+                    <label>To<input type="date" name="audit_date_to" value="<?php echo esc_attr($audit_filters['date_to']); ?>"></label>
+                    <label>Search<input type="search" name="audit_search" value="<?php echo esc_attr($audit_filters['search']); ?>" placeholder="Summary, object or IP"></label>
+                    <button class="soc-btn" type="submit">Filter</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','audit',$base_url)); ?>">Reset</a>
+                </form>
+                <div class="soc-audit-count"><?php echo esc_html(count($audit_entries)); ?> activities shown · newest first</div>
+                <?php if(!$audit_entries): ?><div class="soc-empty">No audit activity matches these filters.</div><?php endif; ?>
+                <?php foreach($audit_entries as $entry): $actor=self::staff_name($entry->actor_user_id); $context=self::audit_context($entry->context); ?>
+                    <article class="soc-audit-item"><div class="soc-audit-head"><div><div class="soc-audit-summary"><?php echo esc_html($entry->summary); ?></div><div class="soc-meta"><?php echo esc_html($actor.' · '.ucwords(str_replace(['.','_','-'],' ',$entry->action_key)).' · '.mysql2date('M j, Y g:i a',$entry->created_at)); ?></div></div><span class="soc-badge"><?php echo esc_html(ucwords(str_replace(['_','-'],' ',$entry->object_type ?: 'system'))); ?></span></div>
+                    <details class="soc-audit-details"><summary>View details</summary><div><strong>Object:</strong> <?php echo esc_html(($entry->object_type ?: 'system').($entry->object_id ? ' #'.$entry->object_id : '')); ?></div><div><strong>IP address:</strong> <?php echo esc_html($entry->ip_address ?: 'Not recorded'); ?></div><?php if($context): ?><code><?php echo esc_html($context); ?></code><?php else: ?><div>No additional context recorded.</div><?php endif; ?></details></article>
+                <?php endforeach; ?>
             </section>
         <?php else: ?>
             <div class="soc-top"><div><h1><?php echo esc_html(self::greeting().', '.self::first_name($user->display_name)); ?></h1><p>Here is what needs attention across your operations.</p></div></div><section class="soc-grid"><div class="soc-stat"><span>My Open Tasks</span><strong><?php echo esc_html($task_counts['mine']); ?></strong></div><div class="soc-stat"><span>Team Queue</span><strong><?php echo esc_html($task_counts['team']); ?></strong></div><div class="soc-stat"><span>Due Today</span><strong><?php echo esc_html($task_counts['due_today']); ?></strong></div><div class="soc-stat"><span>Overdue</span><strong><?php echo esc_html($task_counts['overdue']); ?></strong></div></section><section class="soc-columns"><div class="soc-panel"><h2>My To-do List</h2><?php if(!$recent_tasks): ?><div class="soc-empty">No tasks have been assigned yet.</div><?php endif; ?><?php foreach($recent_tasks as $task): ?><div class="soc-row"><div><div class="soc-row-title"><?php echo esc_html($task->title); ?></div><div class="soc-meta"><?php echo esc_html(ucfirst($task->module).($task->due_at?' · Due '.mysql2date('M j, g:i a',$task->due_at):'')); ?></div></div><span class="soc-badge"><?php echo esc_html(ucfirst($task->priority)); ?></span></div><?php endforeach; ?></div><div class="soc-panel"><h2>Recent Operations Activity</h2><?php if(!$recent_audit): ?><div class="soc-empty">Activity will appear here as operations begin.</div><?php endif; ?><?php foreach($recent_audit as $entry): ?><div class="soc-row"><div><div class="soc-row-title"><?php echo esc_html($entry->summary); ?></div><div class="soc-meta"><?php echo esc_html(mysql2date('M j, g:i a',$entry->created_at)); ?></div></div></div><?php endforeach; ?></div></section>
@@ -1070,13 +1130,65 @@ final class Surface_Operations_Console {
 
     private static function recent_audit($limit = 6) {
         global $wpdb;
+        if (!self::ensure_audit_table()) return [];
         $table = $wpdb->prefix . 'surface_operations_audit';
         return $wpdb->get_results($wpdb->prepare("SELECT * FROM {$table} ORDER BY id DESC LIMIT %d", $limit));
     }
 
+    private static function filtered_audit($filters = [], $limit = 250) {
+        global $wpdb;
+        if (!self::ensure_audit_table()) return [];
+        $table = $wpdb->prefix . 'surface_operations_audit';
+        $conditions = [];
+        $args = [];
+
+        $staff_id = absint($filters['staff_id'] ?? 0);
+        $object_type = sanitize_key($filters['object_type'] ?? '');
+        $action_key = sanitize_key($filters['action_key'] ?? '');
+        $date_from = sanitize_text_field($filters['date_from'] ?? '');
+        $date_to = sanitize_text_field($filters['date_to'] ?? '');
+        $search = sanitize_text_field($filters['search'] ?? '');
+
+        if ($staff_id) { $conditions[] = 'actor_user_id=%d'; $args[] = $staff_id; }
+        if ($object_type) { $conditions[] = 'object_type=%s'; $args[] = $object_type; }
+        if ($action_key) { $conditions[] = 'action_key=%s'; $args[] = $action_key; }
+        if ($date_from && preg_match('/^\d{4}-\d{2}-\d{2}$/', $date_from)) { $conditions[] = 'created_at >= %s'; $args[] = $date_from . ' 00:00:00'; }
+        if ($date_to && preg_match('/^\d{4}-\d{2}-\d{2}$/', $date_to)) { $conditions[] = 'created_at <= %s'; $args[] = $date_to . ' 23:59:59'; }
+        if ($search !== '') {
+            $like = '%' . $wpdb->esc_like($search) . '%';
+            $conditions[] = '(summary LIKE %s OR action_key LIKE %s OR object_type LIKE %s OR object_id LIKE %s OR ip_address LIKE %s)';
+            array_push($args, $like, $like, $like, $like, $like);
+        }
+
+        $where = $conditions ? ' WHERE ' . implode(' AND ', $conditions) : '';
+        $sql = "SELECT * FROM {$table}{$where} ORDER BY id DESC LIMIT %d";
+        $args[] = max(1, min(500, absint($limit)));
+        return $wpdb->get_results($wpdb->prepare($sql, $args));
+    }
+
+    private static function audit_filter_options() {
+        global $wpdb;
+        if (!self::ensure_audit_table()) return ['actions'=>[], 'objects'=>[]];
+        $table = $wpdb->prefix . 'surface_operations_audit';
+        return [
+            'actions' => array_values(array_filter(array_map('sanitize_key', (array) $wpdb->get_col("SELECT DISTINCT action_key FROM {$table} WHERE action_key<>'' ORDER BY action_key ASC")))),
+            'objects' => array_values(array_filter(array_map('sanitize_key', (array) $wpdb->get_col("SELECT DISTINCT object_type FROM {$table} WHERE object_type<>'' ORDER BY object_type ASC")))),
+        ];
+    }
+
+    private static function audit_context($context) {
+        if (!$context) return '';
+        $decoded = json_decode((string) $context, true);
+        if (json_last_error() === JSON_ERROR_NONE && !empty($decoded)) {
+            return wp_json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        }
+        return sanitize_textarea_field((string) $context);
+    }
+
     private static function audit($action, $object_type, $object_id, $summary, $context = []) {
         global $wpdb;
-        $wpdb->insert($wpdb->prefix . 'surface_operations_audit', [
+        if (!self::ensure_audit_table()) return false;
+        return $wpdb->insert($wpdb->prefix . 'surface_operations_audit', [
             'actor_user_id' => get_current_user_id(),
             'action_key' => sanitize_key($action),
             'object_type' => sanitize_key($object_type),
