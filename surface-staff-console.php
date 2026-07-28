@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.3.8
+ * Version: 1.3.9
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.3.8';
+    const VERSION = '1.3.9';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -28,6 +28,7 @@ final class Surface_Operations_Console {
         add_action('template_redirect', [__CLASS__, 'handle_task_actions'], 5);
         add_action('template_redirect', [__CLASS__, 'handle_partner_actions'], 6);
         add_action('template_redirect', [__CLASS__, 'handle_surfacetooth_actions'], 7);
+        add_action('template_redirect', [__CLASS__, 'handle_campaign_actions'], 8);
         add_action('template_redirect', [__CLASS__, 'guard_staff_frontend'], 20);
 
         add_shortcode('surface_staff_login', [__CLASS__, 'render_login']);
@@ -1216,6 +1217,116 @@ final class Surface_Operations_Console {
         }));
     }
 
+
+    private static function table_exists($table) {
+        global $wpdb;
+        return $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table)) === $table;
+    }
+
+    private static function campaign_status($campaign) {
+        $status = sanitize_key((string) ($campaign->status ?? 'active'));
+        if ($status === 'suspended') return 'suspended';
+        if (in_array($status, ['ended','completed','closed','expired'], true)) return 'ended';
+
+        $start = !empty($campaign->preferred_start_date) ? strtotime((string) $campaign->preferred_start_date . ' 00:00:00') : false;
+        if ($start && $start > current_time('timestamp')) return 'scheduled';
+        return 'active';
+    }
+
+    private static function campaign_partner_name($partner_id) {
+        $partner_id = absint($partner_id);
+        if (!$partner_id) return 'Global campaign';
+        $partner = get_user_by('id', $partner_id);
+        if (!$partner) return 'Unknown partner';
+        $store = (string) get_user_meta($partner_id, 'surface_store', true);
+        if ($store === '') $store = (string) get_user_meta($partner_id, 'surface_name', true);
+        return $store ?: $partner->display_name;
+    }
+
+    private static function campaign_surfacetooth($campaign) {
+        $post_id = absint($campaign->source_application_id ?? 0);
+        if (!$post_id) return null;
+        $post = get_post($post_id);
+        return ($post && !in_array($post->post_status, ['trash','auto-draft'], true)) ? $post : null;
+    }
+
+    private static function campaign_counts($campaign_id) {
+        global $wpdb;
+        $campaign_id = absint($campaign_id);
+        $receipts = $wpdb->prefix . 'surface_receipts';
+        $winners = $wpdb->prefix . 'surface_campaign_winners';
+        $participation = self::table_exists($receipts) ? (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$receipts} WHERE campaign_id=%d", $campaign_id)) : 0;
+        $winner_count = self::table_exists($winners) ? (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT participant_phone) FROM {$winners} WHERE campaign_id=%d", $campaign_id)) : 0;
+        return ['participation'=>$participation, 'winners'=>$winner_count];
+    }
+
+    private static function campaign_cashback_summary($campaign_id) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'surface_campaign_collectibles';
+        if (!self::table_exists($table)) return 'Not configured';
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT MAX(receipt_reward_percent) receipt_cashback, MAX(participation_reward_percent) participation_cashback, MAX(duplicate_exchange_percent) duplicate_cashback FROM {$table} WHERE campaign_id=%d",
+            absint($campaign_id)
+        ));
+        if (!$row || ($row->receipt_cashback === null && $row->participation_cashback === null && $row->duplicate_cashback === null)) return 'Not configured';
+        return 'Receipt '.rtrim(rtrim(number_format((float)$row->receipt_cashback,2,'.',''),'0'),'.').'% · Participation '.rtrim(rtrim(number_format((float)$row->participation_cashback,2,'.',''),'0'),'.').'% · Double collectible '.rtrim(rtrim(number_format((float)$row->duplicate_cashback,2,'.',''),'0'),'.').'%';
+    }
+
+    private static function campaign_grand_cashback($campaign) {
+        $type = trim((string) ($campaign->grand_reward_type ?? ''));
+        $value = trim((string) ($campaign->grand_reward_value ?? ''));
+        if ($type === '' && $value === '') return 'Not configured';
+        return trim(ucwords(str_replace('_',' ',$type)) . ($value !== '' ? ': '.$value : ''));
+    }
+
+    private static function campaign_progress($campaign) {
+        $counts = self::campaign_counts($campaign->id);
+        $expected = max(0, absint($campaign->expected_winners ?? 0));
+        if ($expected > 0) return $counts['winners'].' / '.$expected.' winners';
+        return $counts['participation'].' participations';
+    }
+
+    private static function campaigns($search = '') {
+        global $wpdb;
+        $table = $wpdb->prefix . 'surface_campaigns';
+        if (!self::table_exists($table)) return [];
+        $rows = $wpdb->get_results("SELECT * FROM {$table} ORDER BY id DESC");
+        $search = strtolower(trim((string)$search));
+        if ($search === '') return $rows;
+        return array_values(array_filter($rows, function($campaign) use ($search) {
+            $partner = self::campaign_partner_name($campaign->partner_id ?? 0);
+            $tooth = self::campaign_surfacetooth($campaign);
+            $sii = $tooth ? self::surfacetooth_sii($tooth) : self::partner_sii(absint($campaign->partner_id ?? 0));
+            $haystack = strtolower(($campaign->campaign_name ?? '').' '.$partner.' '.$sii.' '.($campaign->campaign_scope ?? '').' '.($campaign->target_value ?? ''));
+            return strpos($haystack, $search) !== false;
+        }));
+    }
+
+    public static function handle_campaign_actions() {
+        if (!is_user_logged_in() || !self::is_staff()) return;
+        if (empty($_POST['surface_operations_campaign_action'])) return;
+        $user = wp_get_current_user();
+        if (!self::can_access('campaigns', $user->ID)) return;
+        check_admin_referer('surface_operations_campaign', 'surface_operations_campaign_nonce');
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'surface_campaigns';
+        if (!self::table_exists($table)) return;
+        $campaign_id = absint($_POST['campaign_id'] ?? 0);
+        $action = sanitize_key(wp_unslash($_POST['surface_operations_campaign_action']));
+        if (!$campaign_id || !in_array($action, ['suspend','reactivate'], true)) return;
+        $campaign = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $campaign_id));
+        if (!$campaign) return;
+        $new_status = $action === 'suspend' ? 'suspended' : 'active';
+        $wpdb->update($table, ['status'=>$new_status], ['id'=>$campaign_id], ['%s'], ['%d']);
+        self::audit('campaign.'.$new_status, 'campaign', (string)$campaign_id, ucfirst($new_status).' campaign: '.$campaign->campaign_name, [
+            'partner_id'=>absint($campaign->partner_id ?? 0),
+            'scope'=>(string)($campaign->campaign_scope ?? ''),
+        ]);
+        wp_safe_redirect(add_query_arg(['soc_section'=>'campaigns','campaign_notice'=>$new_status], home_url('/'.self::CONSOLE_SLUG.'/')));
+        exit;
+    }
+
     public static function render_console() {
         if (!is_user_logged_in() || !self::is_staff()) {
             return '<script>window.location.href=' . wp_json_encode(home_url('/' . self::LOGIN_SLUG . '/')) . ';</script>';
@@ -1264,6 +1375,16 @@ final class Surface_Operations_Console {
         $view_surfacetooth_id = absint($_GET['view_surfacetooth'] ?? 0);
         $view_surfacetooth = $view_surfacetooth_id ? get_post($view_surfacetooth_id) : null;
         if ($view_surfacetooth && !in_array($view_surfacetooth->post_type, ['product','surface_signal'], true)) $view_surfacetooth = null;
+        $campaign_search = sanitize_text_field(wp_unslash($_GET['campaign_search'] ?? ''));
+        $campaigns = $section === 'campaigns' ? self::campaigns($campaign_search) : [];
+        $campaign_notice = sanitize_key(wp_unslash($_GET['campaign_notice'] ?? ''));
+        $view_campaign_id = absint($_GET['view_campaign'] ?? 0);
+        $view_campaign = false;
+        if ($view_campaign_id) {
+            global $wpdb;
+            $campaign_table = $wpdb->prefix . 'surface_campaigns';
+            if (self::table_exists($campaign_table)) $view_campaign = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$campaign_table} WHERE id=%d", $view_campaign_id));
+        }
 
         ob_start(); ?>
         <style>
@@ -1316,6 +1437,22 @@ final class Surface_Operations_Console {
                 <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">SurfaceTooth Details</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Back to SurfaceTeeth</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Title</span><strong><?php echo esc_html($view_surfacetooth->post_title); ?></strong></div><div class="soc-profile-field"><span>Type</span><strong><?php echo esc_html(self::surfacetooth_type($view_surfacetooth).' SurfaceTooth'); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vt_store ?: ($vt_partner ? $vt_partner->display_name : 'Unknown partner')); ?></strong></div><div class="soc-profile-field"><span>SII</span><strong>/<?php echo esc_html(self::surfacetooth_sii($view_surfacetooth) ?: 'Not assigned'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst(self::surfacetooth_status($view_surfacetooth))); ?></strong></div><div class="soc-profile-field"><span>Channels</span><strong><?php echo esc_html(self::surfacetooth_channels($view_surfacetooth)); ?></strong></div><div class="soc-profile-field"><span>Bundle Summary</span><strong><?php echo esc_html($vt_partner_id?self::partner_bundle_summary($vt_partner_id):'Not available'); ?></strong></div><div class="soc-profile-field"><span>Created</span><strong><?php echo esc_html(mysql2date('M j, Y',$view_surfacetooth->post_date)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Description</span><strong><?php echo nl2br(esc_html(self::surfacetooth_description($view_surfacetooth) ?: 'No description available')); ?></strong></div></div></section>
             <?php endif; ?>
             <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="surfaceteeth"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="surfacetooth_search" value="<?php echo esc_attr($surfacetooth_search); ?>" placeholder="Search title, SII or partner"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Title</th><th>Type</th><th>Partner</th><th>SII</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead><tbody><?php if(!$surfaceteeth): ?><tr><td colspan="7" class="soc-empty">No SurfaceTeeth found.</td></tr><?php endif; ?><?php foreach($surfaceteeth as $tooth): $ts=self::surfacetooth_status($tooth); $tp_id=self::surfacetooth_partner_id($tooth); $tp=$tp_id?get_user_by('id',$tp_id):false; $tp_store=$tp_id?(string)get_user_meta($tp_id,'surface_store',true):''; ?><tr><td><strong><?php echo esc_html($tooth->post_title); ?></strong></td><td><?php echo esc_html(self::surfacetooth_type($tooth)); ?></td><td><?php echo esc_html($tp_store ?: ($tp?$tp->display_name:'Unknown')); ?></td><td>/<?php echo esc_html(self::surfacetooth_sii($tooth) ?: '—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ts)); ?></span></td><td><?php echo esc_html(mysql2date('M j, Y',$tooth->post_date)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'surfaceteeth','view_surfacetooth'=>$tooth->ID],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_surfacetooth','surface_operations_surfacetooth_nonce'); ?><input type="hidden" name="surfacetooth_id" value="<?php echo esc_attr($tooth->ID); ?>"><input type="hidden" name="surface_operations_surfacetooth_action" value="<?php echo esc_attr($ts==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $ts==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($ts==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+        <?php elseif($section==='campaigns'):
+            $all_campaigns=self::campaigns('');
+            $campaign_counts=['total'=>count($all_campaigns),'active'=>0,'scheduled'=>0,'ended'=>0,'suspended'=>0];
+            foreach($all_campaigns as $campaign){$cs=self::campaign_status($campaign);if(isset($campaign_counts[$cs]))$campaign_counts[$cs]++;}
+        ?>
+            <div class="soc-top"><div><h1>Campaign Operations</h1><p>Review Receipt SurfaceTooth campaigns and control operational availability.</p></div></div>
+            <?php if($campaign_notice): ?><div class="soc-alert">Campaign status updated.</div><?php endif; ?>
+            <section class="soc-grid" style="grid-template-columns:repeat(5,minmax(0,1fr));margin-bottom:18px"><div class="soc-stat"><span>Total Campaigns</span><strong><?php echo esc_html($campaign_counts['total']); ?></strong></div><div class="soc-stat"><span>Active</span><strong><?php echo esc_html($campaign_counts['active']); ?></strong></div><div class="soc-stat"><span>Scheduled</span><strong><?php echo esc_html($campaign_counts['scheduled']); ?></strong></div><div class="soc-stat"><span>Ended</span><strong><?php echo esc_html($campaign_counts['ended']); ?></strong></div><div class="soc-stat"><span>Suspended</span><strong><?php echo esc_html($campaign_counts['suspended']); ?></strong></div></section>
+            <?php if($view_campaign):
+                $vc_partner=self::campaign_partner_name($view_campaign->partner_id ?? 0);
+                $vc_tooth=self::campaign_surfacetooth($view_campaign);
+                $vc_counts=self::campaign_counts($view_campaign->id);
+            ?>
+                <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">Campaign Details</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Back to Campaigns</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Campaign Name</span><strong><?php echo esc_html($view_campaign->campaign_name); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vc_partner); ?></strong></div><div class="soc-profile-field"><span>SurfaceTooth</span><strong><?php echo esc_html($vc_tooth ? $vc_tooth->post_title : 'Receipt SurfaceTooth'); ?></strong></div><div class="soc-profile-field"><span>Campaign Type</span><strong><?php echo esc_html(ucfirst((string)($view_campaign->campaign_scope ?? 'partner')).' Receipt Campaign'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst(self::campaign_status($view_campaign))); ?></strong></div><div class="soc-profile-field"><span>Start Date</span><strong><?php echo esc_html(!empty($view_campaign->preferred_start_date) ? mysql2date('M j, Y',$view_campaign->preferred_start_date) : 'Immediate'); ?></strong></div><div class="soc-profile-field"><span>End Date</span><strong><?php echo esc_html(!empty($view_campaign->end_date) ? $view_campaign->end_date : 'Not specified'); ?></strong></div><div class="soc-profile-field"><span>Target</span><strong><?php echo esc_html((string)($view_campaign->target_value ?? 'Not specified')); ?></strong></div><div class="soc-profile-field"><span>Expected Winners</span><strong><?php echo esc_html(absint($view_campaign->expected_winners ?? 0)); ?></strong></div><div class="soc-profile-field"><span>Current Winners</span><strong><?php echo esc_html($vc_counts['winners']); ?></strong></div><div class="soc-profile-field"><span>Participation Count</span><strong><?php echo esc_html($vc_counts['participation']); ?></strong></div><div class="soc-profile-field"><span>Progress</span><strong><?php echo esc_html(self::campaign_progress($view_campaign)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Cashback Configuration</span><strong><?php echo esc_html(self::campaign_cashback_summary($view_campaign->id)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Grand Cashback Configuration</span><strong><?php echo esc_html(self::campaign_grand_cashback($view_campaign)); ?></strong></div></div></section>
+            <?php endif; ?>
+            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="campaigns"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="campaign_search" value="<?php echo esc_attr($campaign_search); ?>" placeholder="Search campaign, partner or SII"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Campaign</th><th>Partner</th><th>SurfaceTooth</th><th>Type</th><th>Start</th><th>End</th><th>Status</th><th>Progress</th><th>Actions</th></tr></thead><tbody><?php if(!$campaigns): ?><tr><td colspan="9" class="soc-empty">No campaigns found. Receipt campaigns will appear here when available.</td></tr><?php endif; ?><?php foreach($campaigns as $campaign): $cs=self::campaign_status($campaign);$ct=self::campaign_surfacetooth($campaign); ?><tr><td><strong><?php echo esc_html($campaign->campaign_name); ?></strong></td><td><?php echo esc_html(self::campaign_partner_name($campaign->partner_id ?? 0)); ?></td><td><?php echo esc_html($ct?$ct->post_title:'Receipt SurfaceTooth'); ?></td><td><?php echo esc_html(ucfirst((string)($campaign->campaign_scope ?? 'partner'))); ?></td><td><?php echo esc_html(!empty($campaign->preferred_start_date)?mysql2date('M j, Y',$campaign->preferred_start_date):'Immediate'); ?></td><td><?php echo esc_html(!empty($campaign->end_date)?$campaign->end_date:'—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($cs)); ?></span></td><td><?php echo esc_html(self::campaign_progress($campaign)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'campaigns','view_campaign'=>$campaign->id],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_campaign','surface_operations_campaign_nonce'); ?><input type="hidden" name="campaign_id" value="<?php echo esc_attr($campaign->id); ?>"><input type="hidden" name="surface_operations_campaign_action" value="<?php echo esc_attr($cs==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $cs==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($cs==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
         <?php elseif($section==='audit'): ?>
             <div class="soc-top"><div><h1>Audit Centre</h1><p>Review who did what, where and when across Surface Operations.</p></div></div>
             <section class="soc-panel">
