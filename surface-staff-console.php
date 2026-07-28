@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.4.3
+ * Version: 1.4.4
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.4.3';
+    const VERSION = '1.4.4';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -32,6 +32,7 @@ final class Surface_Operations_Console {
         add_action('template_redirect', [__CLASS__, 'handle_wallet_actions'], 9);
         add_action('template_redirect', [__CLASS__, 'handle_bundle_actions'], 10);
         add_action('template_redirect', [__CLASS__, 'handle_advocate_actions'], 11);
+        add_action('template_redirect', [__CLASS__, 'handle_support_actions'], 12);
         add_filter('rest_request_after_callbacks', [__CLASS__, 'capture_resolve_request'], 10, 3);
         add_action('template_redirect', [__CLASS__, 'guard_staff_frontend'], 20);
 
@@ -139,6 +140,45 @@ final class Surface_Operations_Console {
             KEY channel (channel),
             KEY status (status),
             KEY created_at (created_at)
+        ) {$charset};");
+        $support_cases = $wpdb->prefix . 'surface_operations_support_cases';
+        dbDelta("CREATE TABLE {$support_cases} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            case_code VARCHAR(40) NOT NULL,
+            subject VARCHAR(190) NOT NULL,
+            description LONGTEXT NULL,
+            reporter_name VARCHAR(190) NULL,
+            reporter_email VARCHAR(190) NULL,
+            reporter_phone VARCHAR(80) NULL,
+            partner_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            related_surfacetooth_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            related_campaign_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            related_wallet_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            priority VARCHAR(20) NOT NULL DEFAULT 'normal',
+            status VARCHAR(40) NOT NULL DEFAULT 'open',
+            assigned_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            created_by BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            closed_at DATETIME NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY case_code (case_code),
+            KEY status (status),
+            KEY priority (priority),
+            KEY assigned_user_id (assigned_user_id),
+            KEY partner_user_id (partner_user_id)
+        ) {$charset};");
+
+        $support_notes = $wpdb->prefix . 'surface_operations_support_notes';
+        dbDelta("CREATE TABLE {$support_notes} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            case_id BIGINT UNSIGNED NOT NULL,
+            user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            note_text LONGTEXT NOT NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            KEY case_id (case_id),
+            KEY user_id (user_id)
         ) {$charset};");
         update_option('surface_operations_console_version', self::VERSION, false);
     }
@@ -1840,6 +1880,136 @@ final class Surface_Operations_Console {
         return $out;
     }
 
+    private static function ensure_support_tables() {
+        global $wpdb;
+        $cases = $wpdb->prefix . 'surface_operations_support_cases';
+        $notes = $wpdb->prefix . 'surface_operations_support_notes';
+        if (self::table_exists($cases) && self::table_exists($notes)) return true;
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        $charset = $wpdb->get_charset_collate();
+        dbDelta("CREATE TABLE {$cases} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            case_code VARCHAR(40) NOT NULL,
+            subject VARCHAR(190) NOT NULL,
+            description LONGTEXT NULL,
+            reporter_name VARCHAR(190) NULL,
+            reporter_email VARCHAR(190) NULL,
+            reporter_phone VARCHAR(80) NULL,
+            partner_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            related_surfacetooth_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            related_campaign_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            related_wallet_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            priority VARCHAR(20) NOT NULL DEFAULT 'normal',
+            status VARCHAR(40) NOT NULL DEFAULT 'open',
+            assigned_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            created_by BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            closed_at DATETIME NULL,
+            PRIMARY KEY (id), UNIQUE KEY case_code (case_code), KEY status (status), KEY priority (priority), KEY assigned_user_id (assigned_user_id), KEY partner_user_id (partner_user_id)
+        ) {$charset};");
+        dbDelta("CREATE TABLE {$notes} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            case_id BIGINT UNSIGNED NOT NULL,
+            user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            note_text LONGTEXT NOT NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY (id), KEY case_id (case_id), KEY user_id (user_id)
+        ) {$charset};");
+        return self::table_exists($cases) && self::table_exists($notes);
+    }
+
+    private static function support_statuses() {
+        return ['open'=>'Open','in_progress'=>'In Progress','waiting_partner'=>'Waiting on Partner','waiting_customer'=>'Waiting on Customer','resolved'=>'Resolved','closed'=>'Closed'];
+    }
+
+    public static function handle_support_actions() {
+        if (!is_user_logged_in() || !self::is_staff() || !self::can_access('support')) return;
+        if (empty($_POST['surface_operations_support_action'])) return;
+        if (!isset($_POST['surface_operations_support_nonce']) || !wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['surface_operations_support_nonce'])), 'surface_operations_support')) return;
+        if (!self::ensure_support_tables()) return;
+        global $wpdb;
+        $cases=$wpdb->prefix.'surface_operations_support_cases';
+        $notes=$wpdb->prefix.'surface_operations_support_notes';
+        $action=sanitize_key(wp_unslash($_POST['surface_operations_support_action']));
+        $case_id=absint($_POST['case_id'] ?? 0);
+        $now=current_time('mysql');
+        $notice='updated';
+        if ($action==='create') {
+            $subject=sanitize_text_field(wp_unslash($_POST['case_subject'] ?? ''));
+            if ($subject==='') return;
+            $code='SC-'.gmdate('ymd').'-'.strtoupper(wp_generate_password(5,false,false));
+            $wpdb->insert($cases,[
+                'case_code'=>$code,'subject'=>$subject,'description'=>sanitize_textarea_field(wp_unslash($_POST['case_description'] ?? '')),
+                'reporter_name'=>sanitize_text_field(wp_unslash($_POST['reporter_name'] ?? '')),'reporter_email'=>sanitize_email(wp_unslash($_POST['reporter_email'] ?? '')),
+                'reporter_phone'=>sanitize_text_field(wp_unslash($_POST['reporter_phone'] ?? '')),'partner_user_id'=>absint($_POST['partner_user_id'] ?? 0),
+                'priority'=>in_array(sanitize_key($_POST['case_priority'] ?? ''),['low','normal','high','urgent'],true)?sanitize_key($_POST['case_priority']):'normal',
+                'status'=>'open','assigned_user_id'=>absint($_POST['assigned_user_id'] ?? 0),'created_by'=>get_current_user_id(),'created_at'=>$now,'updated_at'=>$now
+            ]);
+            $case_id=(int)$wpdb->insert_id; $notice='created';
+            self::audit('support_case_created','support_case',(string)$case_id,'Created support case: '.$code,['subject'=>$subject]);
+        } elseif ($case_id) {
+            $case=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$cases} WHERE id=%d",$case_id));
+            if (!$case) return;
+            if ($action==='assign') {
+                $assigned=absint($_POST['assigned_user_id'] ?? 0);
+                $wpdb->update($cases,['assigned_user_id'=>$assigned,'updated_at'=>$now],['id'=>$case_id]);
+                self::audit('support_case_assigned','support_case',(string)$case_id,'Assigned support case: '.$case->case_code,['assigned_user_id'=>$assigned]);
+                $notice='assigned';
+            } elseif ($action==='status') {
+                $status=sanitize_key(wp_unslash($_POST['case_status'] ?? ''));
+                if (!array_key_exists($status,self::support_statuses())) return;
+                $data=['status'=>$status,'updated_at'=>$now,'closed_at'=>$status==='closed'?$now:null];
+                $wpdb->update($cases,$data,['id'=>$case_id]);
+                self::audit('support_case_status_changed','support_case',(string)$case_id,'Changed support case status: '.$case->case_code,['from'=>$case->status,'to'=>$status]);
+                $notice='status';
+            } elseif ($action==='note') {
+                $text=sanitize_textarea_field(wp_unslash($_POST['note_text'] ?? ''));
+                if ($text==='') return;
+                $wpdb->insert($notes,['case_id'=>$case_id,'user_id'=>get_current_user_id(),'note_text'=>$text,'created_at'=>$now]);
+                $wpdb->update($cases,['updated_at'=>$now],['id'=>$case_id]);
+                self::audit('support_note_added','support_case',(string)$case_id,'Added internal support note: '.$case->case_code,['note_id'=>(int)$wpdb->insert_id]);
+                $notice='note';
+            } elseif ($action==='close') {
+                $wpdb->update($cases,['status'=>'closed','closed_at'=>$now,'updated_at'=>$now],['id'=>$case_id]);
+                self::audit('support_case_closed','support_case',(string)$case_id,'Closed support case: '.$case->case_code,[]);
+                $notice='closed';
+            }
+        }
+        wp_safe_redirect(add_query_arg(['soc_section'=>'support','view_case'=>$case_id,'support_notice'=>$notice],home_url('/'.self::CONSOLE_SLUG.'/'))); exit;
+    }
+
+    private static function support_cases($search='') {
+        global $wpdb; if(!self::ensure_support_tables()) return [];
+        $table=$wpdb->prefix.'surface_operations_support_cases';
+        if($search==='') return $wpdb->get_results("SELECT * FROM {$table} ORDER BY updated_at DESC,id DESC LIMIT 250");
+        $like='%'.$wpdb->esc_like($search).'%';
+        $ids=get_users(['search'=>'*'.$search.'*','search_columns'=>['display_name','user_email','user_login'],'fields'=>'ID']);
+        $sql="SELECT * FROM {$table} WHERE case_code LIKE %s OR subject LIKE %s OR reporter_name LIKE %s OR reporter_email LIKE %s OR reporter_phone LIKE %s";
+        $args=[$like,$like,$like,$like,$like];
+        if($ids){$sql.=' OR partner_user_id IN ('.implode(',',array_map('absint',$ids)).')';}
+        return $wpdb->get_results($wpdb->prepare($sql.' ORDER BY updated_at DESC,id DESC LIMIT 250',$args));
+    }
+
+    private static function support_summary() {
+        global $wpdb; $out=array_fill_keys(array_keys(self::support_statuses()),0); if(!self::ensure_support_tables()) return $out;
+        $rows=$wpdb->get_results("SELECT status,COUNT(*) total FROM {$wpdb->prefix}surface_operations_support_cases GROUP BY status");
+        foreach($rows as $r) if(isset($out[$r->status])) $out[$r->status]=(int)$r->total; return $out;
+    }
+
+    private static function support_notes($case_id) {
+        global $wpdb; if(!self::ensure_support_tables()) return [];
+        return $wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}surface_operations_support_notes WHERE case_id=%d ORDER BY id ASC",$case_id));
+    }
+
+    private static function support_partner_label($user_id) {
+        $user_id=absint($user_id); if(!$user_id) return 'Customer / unlinked';
+        $business=trim((string)get_user_meta($user_id,'surface_store',true));
+        if($business!=='') return $business;
+        $sii=self::partner_sii($user_id); if($sii!=='') return '/'.ltrim($sii,'/');
+        $u=get_user_by('id',$user_id); return $u?$u->display_name:'Partner #'.$user_id;
+    }
+
     private static function resolver_partner_name($id) {
         $id = absint($id);
         if (!$id) return 'Not linked';
@@ -1978,9 +2148,24 @@ final class Surface_Operations_Console {
             if ($view_resolve && $section === 'resolver') self::audit('resolve_viewed','resolver',(string)$view_resolve->resolve_id,'Viewed resolver record: '.$view_resolve->resolve_id,['requested_sii'=>$view_resolve->requested_sii,'status'=>$view_resolve->status]);
         }
 
+        $support_search = sanitize_text_field(wp_unslash($_GET['support_search'] ?? ''));
+        $support_cases = $section === 'support' ? self::support_cases($support_search) : [];
+        $support_totals = $section === 'support' ? self::support_summary() : array_fill_keys(array_keys(self::support_statuses()),0);
+        $support_notice = sanitize_key(wp_unslash($_GET['support_notice'] ?? ''));
+        $view_case_id = absint($_GET['view_case'] ?? 0);
+        $view_case = false; $view_case_notes=[];
+        if ($view_case_id && self::ensure_support_tables()) {
+            global $wpdb;
+            $view_case=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}surface_operations_support_cases WHERE id=%d",$view_case_id));
+            if($view_case && $section==='support') {
+                $view_case_notes=self::support_notes($view_case_id);
+                self::audit('support_case_viewed','support_case',(string)$view_case_id,'Viewed support case: '.$view_case->case_code,['status'=>$view_case->status]);
+            }
+        }
+
         ob_start(); ?>
         <style>
-        body{background:#f4f6f8!important}.soc-app{min-height:100vh;display:grid;grid-template-columns:250px 1fr;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827}.soc-sidebar{background:#111827;color:#fff;padding:26px 18px;position:sticky;top:0;height:100vh;box-sizing:border-box}.soc-brand{font-size:19px;font-weight:800;padding:0 10px 24px}.soc-brand small{display:block;color:#9ca3af;font-size:11px;font-weight:600;margin-top:4px}.soc-nav a{display:block;color:#cbd5e1;text-decoration:none;padding:11px 12px;border-radius:10px;margin:3px 0;font-size:14px}.soc-nav a:hover,.soc-nav a.active{background:#1f2937;color:#fff}.soc-sidebar-foot{position:absolute;left:18px;right:18px;bottom:22px;border-top:1px solid #374151;padding-top:16px}.soc-sidebar-foot strong,.soc-sidebar-foot span{display:block}.soc-sidebar-foot span{font-size:12px;color:#9ca3af;margin:3px 0 10px}.soc-sidebar-foot a{color:#cbd5e1;font-size:13px}.soc-main{padding:30px}.soc-top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:25px}.soc-top h1{font-size:29px;margin:0 0 4px}.soc-top p{margin:0;color:#6b7280}.soc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.soc-stat,.soc-panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px}.soc-stat{padding:20px}.soc-stat span{display:block;color:#6b7280;font-size:13px}.soc-stat strong{display:block;font-size:30px;margin-top:7px}.soc-columns{display:grid;grid-template-columns:1.25fr .9fr;gap:18px;margin-top:18px}.soc-panel{padding:21px}.soc-panel h2{font-size:17px;margin:0 0 16px}.soc-row{display:flex;justify-content:space-between;gap:14px;padding:13px 0;border-top:1px solid #f0f1f3}.soc-row:first-of-type{border-top:0}.soc-row-title{font-weight:700;font-size:14px}.soc-meta{font-size:12px;color:#6b7280;margin-top:4px}.soc-badge{height:max-content;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:750;background:#f3f4f6}.soc-empty{color:#6b7280;font-size:14px;padding:8px 0}.soc-task-grid{display:grid;grid-template-columns:340px 1fr;gap:18px}.soc-form label{display:block;font-size:12px;font-weight:700;margin:0 0 6px}.soc-form input,.soc-form select,.soc-form textarea{width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:10px;margin:0 0 13px;background:#fff}.soc-form textarea{min-height:90px;resize:vertical}.soc-btn{border:0;border-radius:10px;background:#111827;color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}.soc-btn-light{background:#eef0f3;color:#111827}.soc-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.soc-task{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-task-head{display:flex;justify-content:space-between;gap:12px}.soc-task h3{font-size:15px;margin:0}.soc-task p{font-size:13px;color:#4b5563}.soc-inline{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.soc-inline select,.soc-inline input{margin:0}.soc-alert{padding:12px 14px;border-radius:10px;background:#ecfdf5;color:#065f46;margin-bottom:16px}.soc-comments{margin-top:13px;padding-top:12px;border-top:1px solid #eef0f2}.soc-comment{font-size:12px;padding:7px 0}.soc-comment b{display:block}.soc-overdue{color:#b91c1c;font-weight:700}.soc-filters{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:14px;padding:12px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px}.soc-filters label{font-size:12px;font-weight:700}.soc-filters select{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-filters input{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-audit-item{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-audit-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.soc-audit-summary{font-weight:750;font-size:14px}.soc-audit-details{margin-top:12px;padding-top:12px;border-top:1px solid #eef0f2;font-size:12px;color:#4b5563}.soc-audit-details code{display:block;white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:10px;border-radius:8px;margin-top:8px}.soc-audit-count{font-size:13px;color:#6b7280;margin-bottom:12px}.soc-table-wrap{overflow-x:auto}.soc-table{width:100%;border-collapse:collapse}.soc-table th,.soc-table td{text-align:left;padding:13px 10px;border-bottom:1px solid #e5e7eb;font-size:13px;vertical-align:middle}.soc-table th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#6b7280}.soc-partner-profile{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.soc-profile-field{padding:14px;background:#f8fafc;border-radius:12px}.soc-profile-field span{display:block;color:#6b7280;font-size:11px;text-transform:uppercase}.soc-profile-field strong{display:block;margin-top:5px;font-size:14px}@media(max-width:900px){.soc-app{grid-template-columns:1fr}.soc-sidebar{height:auto;position:relative}.soc-sidebar-foot{position:static;margin-top:20px}.soc-main{padding:20px}.soc-grid{grid-template-columns:repeat(2,1fr)}.soc-columns,.soc-task-grid{grid-template-columns:1fr}}@media(max-width:520px){.soc-grid{grid-template-columns:1fr}}
+        body{background:#f4f6f8!important}.soc-app{min-height:100vh;display:grid;grid-template-columns:250px 1fr;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827}.soc-sidebar{background:#111827;color:#fff;padding:26px 18px;position:sticky;top:0;height:100vh;box-sizing:border-box}.soc-brand{font-size:19px;font-weight:800;padding:0 10px 24px}.soc-brand small{display:block;color:#9ca3af;font-size:11px;font-weight:600;margin-top:4px}.soc-nav a{display:block;color:#cbd5e1;text-decoration:none;padding:11px 12px;border-radius:10px;margin:3px 0;font-size:14px}.soc-nav a:hover,.soc-nav a.active{background:#1f2937;color:#fff}.soc-sidebar-foot{position:absolute;left:18px;right:18px;bottom:22px;border-top:1px solid #374151;padding-top:16px}.soc-sidebar-foot strong,.soc-sidebar-foot span{display:block}.soc-sidebar-foot span{font-size:12px;color:#9ca3af;margin:3px 0 10px}.soc-sidebar-foot a{color:#cbd5e1;font-size:13px}.soc-main{padding:30px}.soc-top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:25px}.soc-top h1{font-size:29px;margin:0 0 4px}.soc-top p{margin:0;color:#6b7280}.soc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.soc-stat,.soc-panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px}.soc-stat{padding:20px}.soc-stat span{display:block;color:#6b7280;font-size:13px}.soc-stat strong{display:block;font-size:30px;margin-top:7px}.soc-columns{display:grid;grid-template-columns:1.25fr .9fr;gap:18px;margin-top:18px}.soc-panel{padding:21px}.soc-panel h2{font-size:17px;margin:0 0 16px}.soc-row{display:flex;justify-content:space-between;gap:14px;padding:13px 0;border-top:1px solid #f0f1f3}.soc-row:first-of-type{border-top:0}.soc-row-title{font-weight:700;font-size:14px}.soc-meta{font-size:12px;color:#6b7280;margin-top:4px}.soc-badge{height:max-content;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:750;background:#f3f4f6}.soc-empty{color:#6b7280;font-size:14px;padding:8px 0}.soc-task-grid{display:grid;grid-template-columns:340px 1fr;gap:18px}.soc-form label{display:block;font-size:12px;font-weight:700;margin:0 0 6px}.soc-form input,.soc-form select,.soc-form textarea{width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:10px;margin:0 0 13px;background:#fff}.soc-form textarea{min-height:90px;resize:vertical}.soc-btn{border:0;border-radius:10px;background:#111827;color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}.soc-btn-light{background:#eef0f3;color:#111827}.soc-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.soc-task{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-task-head{display:flex;justify-content:space-between;gap:12px}.soc-task h3{font-size:15px;margin:0}.soc-task p{font-size:13px;color:#4b5563}.soc-inline{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.soc-inline select,.soc-inline input{margin:0}.soc-alert{padding:12px 14px;border-radius:10px;background:#ecfdf5;color:#065f46;margin-bottom:16px}.soc-comments{margin-top:13px;padding-top:12px;border-top:1px solid #eef0f2}.soc-comment{font-size:12px;padding:7px 0}.soc-comment b{display:block}.soc-overdue{color:#b91c1c;font-weight:700}.soc-filters{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:14px;padding:12px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px}.soc-filters label{font-size:12px;font-weight:700}.soc-filters select{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-filters input{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-audit-item{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-audit-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.soc-audit-summary{font-weight:750;font-size:14px}.soc-audit-details{margin-top:12px;padding-top:12px;border-top:1px solid #eef0f2;font-size:12px;color:#4b5563}.soc-audit-details code{display:block;white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:10px;border-radius:8px;margin-top:8px}.soc-audit-count{font-size:13px;color:#6b7280;margin-bottom:12px}.soc-table-wrap{overflow-x:auto}.soc-table{width:100%;border-collapse:collapse}.soc-table th,.soc-table td{text-align:left;padding:13px 10px;border-bottom:1px solid #e5e7eb;font-size:13px;vertical-align:middle}.soc-table th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#6b7280}.soc-partner-profile{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.soc-profile-field{padding:14px;background:#f8fafc;border-radius:12px}.soc-profile-field span{display:block;color:#6b7280;font-size:11px;text-transform:uppercase}.soc-profile-field strong{display:block;margin-top:5px;font-size:14px}.soc-timeline{border-left:2px solid #e5e7eb;margin-left:8px;padding-left:18px}.soc-timeline-item{margin:0 0 16px}.soc-note{background:#f8fafc;border-radius:12px;padding:13px;margin-bottom:10px}@media(max-width:900px){.soc-app{grid-template-columns:1fr}.soc-sidebar{height:auto;position:relative}.soc-sidebar-foot{position:static;margin-top:20px}.soc-main{padding:20px}.soc-grid{grid-template-columns:repeat(2,1fr)}.soc-columns,.soc-task-grid{grid-template-columns:1fr}}@media(max-width:520px){.soc-grid{grid-template-columns:1fr}}
         </style>
         <div class="soc-app"><aside class="soc-sidebar"><div class="soc-brand">Surface Operations<small>Operating the Surface Internet</small></div><nav class="soc-nav">
         <?php $nav=['dashboard'=>'Dashboard','tasks'=>'Tasks','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth™','advocates'=>'Advocates','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','resolver'=>'Resolver','support'=>'Support','reports'=>'Reports','teams'=>'Teams','staff'=>'Staff','audit'=>'Audit']; foreach($nav as $key=>$label){if(!self::can_access($key,$user->ID))continue;$url=add_query_arg('soc_section',$key,$base_url);echo '<a class="'.($key===$section?'active':'').'" href="'.esc_url($url).'">'.esc_html($label).'</a>';} ?>
@@ -2051,6 +2236,23 @@ final class Surface_Operations_Console {
                 <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">Campaign Details</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Back to Campaigns</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Campaign Name</span><strong><?php echo esc_html($view_campaign->campaign_name); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vc_partner); ?></strong></div><div class="soc-profile-field"><span>SurfaceTooth</span><strong><?php echo esc_html($vc_tooth ? $vc_tooth->post_title : 'Receipt SurfaceTooth'); ?></strong></div><div class="soc-profile-field"><span>Campaign Type</span><strong><?php echo esc_html(ucfirst((string)($view_campaign->campaign_scope ?? 'partner')).' Receipt Campaign'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst(self::campaign_status($view_campaign))); ?></strong></div><div class="soc-profile-field"><span>Start Date</span><strong><?php echo esc_html(!empty($view_campaign->preferred_start_date) ? mysql2date('M j, Y',$view_campaign->preferred_start_date) : 'Immediate'); ?></strong></div><div class="soc-profile-field"><span>End Date</span><strong><?php echo esc_html(!empty($view_campaign->end_date) ? $view_campaign->end_date : 'Not specified'); ?></strong></div><div class="soc-profile-field"><span>Target</span><strong><?php echo esc_html((string)($view_campaign->target_value ?? 'Not specified')); ?></strong></div><div class="soc-profile-field"><span>Expected Winners</span><strong><?php echo esc_html(absint($view_campaign->expected_winners ?? 0)); ?></strong></div><div class="soc-profile-field"><span>Current Winners</span><strong><?php echo esc_html($vc_counts['winners']); ?></strong></div><div class="soc-profile-field"><span>Participation Count</span><strong><?php echo esc_html($vc_counts['participation']); ?></strong></div><div class="soc-profile-field"><span>Progress</span><strong><?php echo esc_html(self::campaign_progress($view_campaign)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Cashback Configuration</span><strong><?php echo esc_html(self::campaign_cashback_summary($view_campaign->id)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Grand Cashback Configuration</span><strong><?php echo esc_html(self::campaign_grand_cashback($view_campaign)); ?></strong></div></div></section>
             <?php endif; ?>
             <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="campaigns"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="campaign_search" value="<?php echo esc_attr($campaign_search); ?>" placeholder="Search campaign, partner or SII"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Campaign</th><th>Partner</th><th>SurfaceTooth</th><th>Type</th><th>Start</th><th>End</th><th>Status</th><th>Progress</th><th>Actions</th></tr></thead><tbody><?php if(!$campaigns): ?><tr><td colspan="9" class="soc-empty">No campaigns found. Receipt campaigns will appear here when available.</td></tr><?php endif; ?><?php foreach($campaigns as $campaign): $cs=self::campaign_status($campaign);$ct=self::campaign_surfacetooth($campaign); ?><tr><td><strong><?php echo esc_html($campaign->campaign_name); ?></strong></td><td><?php echo esc_html(self::campaign_partner_name($campaign->partner_id ?? 0)); ?></td><td><?php echo esc_html($ct?$ct->post_title:'Receipt SurfaceTooth'); ?></td><td><?php echo esc_html(ucfirst((string)($campaign->campaign_scope ?? 'partner'))); ?></td><td><?php echo esc_html(!empty($campaign->preferred_start_date)?mysql2date('M j, Y',$campaign->preferred_start_date):'Immediate'); ?></td><td><?php echo esc_html(!empty($campaign->end_date)?$campaign->end_date:'—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($cs)); ?></span></td><td><?php echo esc_html(self::campaign_progress($campaign)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'campaigns','view_campaign'=>$campaign->id],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_campaign','surface_operations_campaign_nonce'); ?><input type="hidden" name="campaign_id" value="<?php echo esc_attr($campaign->id); ?>"><input type="hidden" name="surface_operations_campaign_action" value="<?php echo esc_attr($cs==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $cs==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($cs==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+        <?php elseif($section==='support'): ?>
+            <div class="soc-top"><div><h1>Support & Case Management</h1><p>Manage partner and customer operational cases in one audited workspace.</p></div></div>
+            <?php if($support_notice): ?><div class="soc-alert">Support case action completed.</div><?php endif; ?>
+            <section class="soc-grid" style="grid-template-columns:repeat(6,minmax(0,1fr));margin-bottom:18px">
+                <?php foreach(self::support_statuses() as $key=>$label): ?><div class="soc-stat"><span><?php echo esc_html($label); ?></span><strong><?php echo esc_html($support_totals[$key] ?? 0); ?></strong></div><?php endforeach; ?>
+            </section>
+            <?php if($view_case): $assigned=get_user_by('id',(int)$view_case->assigned_user_id); ?>
+            <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0"><?php echo esc_html($view_case->case_code.' · '.$view_case->subject); ?></h2><p>Case details and internal operational timeline.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','support',$base_url)); ?>">Back to Support</a></div>
+                <div class="soc-partner-profile"><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(self::support_statuses()[$view_case->status] ?? ucfirst($view_case->status)); ?></strong></div><div class="soc-profile-field"><span>Priority</span><strong><?php echo esc_html(ucfirst($view_case->priority)); ?></strong></div><div class="soc-profile-field"><span>Reporter</span><strong><?php echo esc_html($view_case->reporter_name ?: 'Not supplied'); ?></strong></div><div class="soc-profile-field"><span>Phone / Email</span><strong><?php echo esc_html(trim(($view_case->reporter_phone ?: '').' '.($view_case->reporter_email ?: '')) ?: 'Not supplied'); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html(self::support_partner_label($view_case->partner_user_id)); ?></strong></div><div class="soc-profile-field"><span>Assigned Staff</span><strong><?php echo esc_html($assigned?$assigned->display_name:'Unassigned'); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Description</span><strong><?php echo nl2br(esc_html($view_case->description ?: 'No description supplied.')); ?></strong></div></div>
+                <div class="soc-columns"><div><h2>Internal Notes</h2><?php if(!$view_case_notes): ?><div class="soc-empty">No internal notes yet.</div><?php endif; ?><?php foreach($view_case_notes as $note): ?><div class="soc-note"><strong><?php echo esc_html(self::staff_name($note->user_id)); ?></strong><div class="soc-meta"><?php echo esc_html(mysql2date('M j, Y g:i a',$note->created_at)); ?></div><div style="margin-top:7px"><?php echo nl2br(esc_html($note->note_text)); ?></div></div><?php endforeach; ?></div>
+                <div><h2>Case Actions</h2><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_support','surface_operations_support_nonce'); ?><input type="hidden" name="case_id" value="<?php echo esc_attr($view_case->id); ?>"><input type="hidden" name="surface_operations_support_action" value="assign"><label>Assign / Reassign</label><select name="assigned_user_id"><option value="0">Unassigned</option><?php foreach($staff_list as $member): if(self::staff_status($member->ID)==='suspended')continue; ?><option value="<?php echo esc_attr($member->ID); ?>" <?php selected($view_case->assigned_user_id,$member->ID); ?>><?php echo esc_html($member->display_name); ?></option><?php endforeach; ?></select><button class="soc-btn" type="submit">Save Assignment</button></form>
+                <form class="soc-form" method="post" style="margin-top:16px"><?php wp_nonce_field('surface_operations_support','surface_operations_support_nonce'); ?><input type="hidden" name="case_id" value="<?php echo esc_attr($view_case->id); ?>"><input type="hidden" name="surface_operations_support_action" value="status"><label>Change Status</label><select name="case_status"><?php foreach(self::support_statuses() as $k=>$v): ?><option value="<?php echo esc_attr($k); ?>" <?php selected($view_case->status,$k); ?>><?php echo esc_html($v); ?></option><?php endforeach; ?></select><button class="soc-btn" type="submit">Update Status</button></form>
+                <form class="soc-form" method="post" style="margin-top:16px"><?php wp_nonce_field('surface_operations_support','surface_operations_support_nonce'); ?><input type="hidden" name="case_id" value="<?php echo esc_attr($view_case->id); ?>"><input type="hidden" name="surface_operations_support_action" value="note"><label>Add Internal Note</label><textarea name="note_text" required></textarea><button class="soc-btn" type="submit">Add Note</button></form>
+                <?php if($view_case->status!=='closed'): ?><form method="post" style="margin-top:16px"><?php wp_nonce_field('surface_operations_support','surface_operations_support_nonce'); ?><input type="hidden" name="case_id" value="<?php echo esc_attr($view_case->id); ?>"><input type="hidden" name="surface_operations_support_action" value="close"><button class="soc-btn" type="submit">Close Case</button></form><?php endif; ?></div></div>
+            </section><?php endif; ?>
+            <section class="soc-task-grid"><div class="soc-panel"><h2>New Case</h2><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_support','surface_operations_support_nonce'); ?><input type="hidden" name="surface_operations_support_action" value="create"><label>Subject</label><input name="case_subject" required><label>Description</label><textarea name="case_description"></textarea><label>Reporter Name</label><input name="reporter_name"><label>Email</label><input type="email" name="reporter_email"><label>Phone</label><input name="reporter_phone"><label>Related Partner</label><select name="partner_user_id"><option value="0">Customer / not linked</option><?php foreach(self::surface_partners('') as $partner): ?><option value="<?php echo esc_attr($partner->ID); ?>"><?php echo esc_html(self::support_partner_label($partner->ID)); ?></option><?php endforeach; ?></select><label>Priority</label><select name="case_priority"><option value="low">Low</option><option value="normal" selected>Normal</option><option value="high">High</option><option value="urgent">Urgent</option></select><label>Assign to</label><select name="assigned_user_id"><option value="0">Unassigned</option><?php foreach($staff_list as $member): if(self::staff_status($member->ID)==='suspended')continue; ?><option value="<?php echo esc_attr($member->ID); ?>"><?php echo esc_html($member->display_name); ?></option><?php endforeach; ?></select><button class="soc-btn" type="submit">Create Case</button></form></div>
+            <div class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="support"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="support_search" value="<?php echo esc_attr($support_search); ?>" placeholder="Case ID, subject, partner, customer, phone or SII"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','support',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Case ID</th><th>Subject</th><th>Partner / Customer</th><th>Priority</th><th>Assigned Staff</th><th>Status</th><th>Created</th><th>Last Updated</th><th>Actions</th></tr></thead><tbody><?php if(!$support_cases): ?><tr><td colspan="9" class="soc-empty">No support cases found.</td></tr><?php endif; ?><?php foreach($support_cases as $case): $case_staff=get_user_by('id',(int)$case->assigned_user_id); ?><tr><td><strong><?php echo esc_html($case->case_code); ?></strong></td><td><?php echo esc_html($case->subject); ?><div class="soc-meta"><?php echo esc_html($case->reporter_name ?: $case->reporter_phone ?: 'Reporter not supplied'); ?></div></td><td><?php echo esc_html(self::support_partner_label($case->partner_user_id)); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($case->priority)); ?></span></td><td><?php echo esc_html($case_staff?$case_staff->display_name:'Unassigned'); ?></td><td><span class="soc-badge"><?php echo esc_html(self::support_statuses()[$case->status] ?? ucfirst($case->status)); ?></span></td><td><?php echo esc_html(mysql2date('M j, Y',$case->created_at)); ?></td><td><?php echo esc_html(mysql2date('M j, Y g:i a',$case->updated_at)); ?></td><td><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'support','view_case'=>$case->id],$base_url)); ?>">View</a></td></tr><?php endforeach; ?></tbody></table></div></div></section>
         <?php elseif($section==='resolver'): ?>
             <div class="soc-top"><div><h1>Surface Resolver Operations Centre</h1><p>Monitor live Surface resolution activity without changing resolver behaviour.</p></div></div>
             <section class="soc-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:18px"><div class="soc-stat"><span>Total Resolves</span><strong><?php echo esc_html($resolver_totals['total']); ?></strong></div><div class="soc-stat"><span>Successful Resolves</span><strong><?php echo esc_html($resolver_totals['successful']); ?></strong></div><div class="soc-stat"><span>Failed Resolves</span><strong><?php echo esc_html($resolver_totals['failed']); ?></strong></div><div class="soc-stat"><span>Active SurfaceTeeth</span><strong><?php echo esc_html($resolver_totals['active_teeth']); ?></strong></div><div class="soc-stat"><span>Top Resolved Partner</span><strong style="font-size:20px"><?php echo esc_html($resolver_totals['top_partner']); ?></strong></div><div class="soc-stat"><span>Top Resolution Channel</span><strong style="font-size:20px"><?php echo esc_html($resolver_totals['top_channel']); ?></strong></div></section>
