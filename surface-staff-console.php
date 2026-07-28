@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.4.5
+ * Version: 1.4.6.3
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.4.5';
+    const VERSION = '1.4.6.3';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -34,6 +34,7 @@ final class Surface_Operations_Console {
         add_action('template_redirect', [__CLASS__, 'handle_bundle_actions'], 10);
         add_action('template_redirect', [__CLASS__, 'handle_advocate_actions'], 11);
         add_action('template_redirect', [__CLASS__, 'handle_support_actions'], 12);
+        add_action('template_redirect', [__CLASS__, 'handle_escalation_actions'], 13);
         add_filter('rest_request_after_callbacks', [__CLASS__, 'capture_resolve_request'], 10, 3);
         add_action('template_redirect', [__CLASS__, 'guard_staff_frontend'], 20);
 
@@ -181,6 +182,56 @@ final class Surface_Operations_Console {
             KEY case_id (case_id),
             KEY user_id (user_id)
         ) {$charset};");
+        $escalations = $wpdb->prefix . 'surface_operations_escalations';
+        dbDelta("CREATE TABLE {$escalations} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            case_code VARCHAR(40) NOT NULL,
+            object_type VARCHAR(80) NOT NULL,
+            object_id VARCHAR(120) NOT NULL,
+            object_label VARCHAR(190) NULL,
+            requested_action VARCHAR(80) NOT NULL DEFAULT 'suspend',
+            reason VARCHAR(80) NOT NULL,
+            severity VARCHAR(20) NOT NULL DEFAULT 'normal',
+            notes LONGTEXT NULL,
+            status VARCHAR(40) NOT NULL DEFAULT 'pending',
+            current_level VARCHAR(40) NOT NULL DEFAULT 'manager',
+            created_by BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            assigned_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            decision_notes LONGTEXT NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            closed_at DATETIME NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY case_code (case_code),
+            KEY object_lookup (object_type, object_id),
+            KEY status (status),
+            KEY current_level (current_level),
+            KEY created_by (created_by)
+        ) {$charset};");
+
+
+        $escalation_events = $wpdb->prefix . 'surface_operations_escalation_events';
+        dbDelta("CREATE TABLE {$escalation_events} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            escalation_id BIGINT UNSIGNED NOT NULL,
+            actor_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            event_key VARCHAR(80) NOT NULL,
+            event_note LONGTEXT NULL,
+            from_level VARCHAR(40) NULL,
+            to_level VARCHAR(40) NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            KEY escalation_id (escalation_id),
+            KEY actor_user_id (actor_user_id),
+            KEY event_key (event_key)
+        ) {$charset};");
+
+        // Repair records created while the workflow owner was stored as 0/blank.
+        $wpdb->query("UPDATE {$escalations} SET current_level='manager' WHERE current_level IS NULL OR current_level='' OR current_level='0'");
+        $wpdb->query("UPDATE {$escalations} SET current_level='manager' WHERE current_level='operations_manager'");
+        $wpdb->query("UPDATE {$escalations} SET current_level='team_lead' WHERE current_level='teamlead'");
+        $wpdb->query("UPDATE {$escalations} SET current_level='operations_director' WHERE current_level='director'");
+
         update_option('surface_operations_console_version', self::VERSION, false);
     }
 
@@ -323,13 +374,13 @@ final class Surface_Operations_Console {
 
     private static function role_permissions() {
         return [
-            'operations_director' => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','analytics','reports','teams','staff','audit'],
-            'operations_manager'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','analytics','reports','teams','staff'],
-            'team_lead'           => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','analytics','reports','teams'],
-            'operations_officer'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','resolver','support'],
-            'finance_officer'     => ['dashboard','tasks','wallet','bundles','reports'],
-            'compliance_officer'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','resolver','audit'],
-            'support_officer'     => ['dashboard','tasks','partners','support'],
+            'operations_director' => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','escalations','analytics','reports','teams','staff','audit'],
+            'operations_manager'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','escalations','analytics','reports','teams','staff'],
+            'team_lead'           => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','escalations','analytics','reports','teams'],
+            'operations_officer'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','resolver','support','escalations'],
+            'finance_officer'     => ['dashboard','tasks','wallet','bundles','escalations','reports'],
+            'compliance_officer'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','resolver','escalations','audit'],
+            'support_officer'     => ['dashboard','tasks','partners','support','escalations'],
             'auditor'             => ['dashboard','resolver','analytics','reports','audit'],
         ];
     }
@@ -1176,6 +1227,223 @@ final class Surface_Operations_Console {
         return $partners;
     }
 
+    private static function can_enforce($user_id = 0) {
+        $user_id = $user_id ?: get_current_user_id();
+        return self::user_level($user_id) === 'operations_director' || self::is_admin_user(get_user_by('id', $user_id));
+    }
+
+    private static function next_escalation_level($user_id) {
+        $level = self::user_level($user_id);
+        if ($level === 'operations_manager') return 'team_lead';
+        if ($level === 'team_lead') return 'operations_director';
+        if ($level === 'operations_director') return 'operations_director';
+        // All officer roles raise first to the Operations Manager.
+        return 'manager';
+    }
+
+    private static function escalation_reasons() {
+        return ['fraud'=>'Fraud','policy_violation'=>'Policy violation','copyright'=>'Copyright','scam'=>'Scam','offensive_content'=>'Offensive content','spam'=>'Spam','security'=>'Security concern','other'=>'Other'];
+    }
+
+    private static function ensure_escalation_tables() {
+        global $wpdb;
+        $main = $wpdb->prefix . 'surface_operations_escalations';
+        $events = $wpdb->prefix . 'surface_operations_escalation_events';
+        if (self::table_exists($main) && self::table_exists($events)) return true;
+        self::activate();
+        return self::table_exists($main) && self::table_exists($events);
+    }
+
+    private static function escalation_event($escalation_id, $event_key, $note = '', $from_level = '', $to_level = '') {
+        global $wpdb;
+        if (!self::ensure_escalation_tables()) return false;
+        return $wpdb->insert($wpdb->prefix . 'surface_operations_escalation_events', [
+            'escalation_id' => absint($escalation_id),
+            'actor_user_id' => get_current_user_id(),
+            'event_key' => sanitize_key($event_key),
+            'event_note' => sanitize_textarea_field($note),
+            'from_level' => sanitize_key($from_level),
+            'to_level' => sanitize_key($to_level),
+            'created_at' => current_time('mysql'),
+        ], ['%d','%d','%s','%s','%s','%s','%s']);
+    }
+
+    private static function escalation_events($escalation_id) {
+        global $wpdb;
+        if (!self::ensure_escalation_tables()) return [];
+        return $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM {$wpdb->prefix}surface_operations_escalation_events WHERE escalation_id=%d ORDER BY created_at ASC,id ASC",
+            absint($escalation_id)
+        ));
+    }
+
+    private static function can_view_escalation($row, $user_id) {
+        if (!$row) return false;
+        if ((int)$row->created_by === (int)$user_id) return true;
+        return in_array(self::user_level($user_id), ['operations_manager','team_lead','operations_director'], true);
+    }
+
+    private static function normalized_escalation_level($level) {
+        $level = sanitize_key((string) $level);
+        $aliases = [
+            'operations_manager'  => 'manager',
+            'manager'            => 'manager',
+            'teamlead'           => 'team_lead',
+            'team_lead'          => 'team_lead',
+            'director'           => 'operations_director',
+            'operations_director'=> 'operations_director',
+            'staff'              => 'creator',
+            'operations_officer' => 'creator',
+            'creator'            => 'creator',
+            '0'                  => 'manager',
+            ''                   => 'manager',
+        ];
+        return $aliases[$level] ?? $level;
+    }
+
+    private static function escalation_owner_label($level) {
+        $level = self::normalized_escalation_level($level);
+        $labels = [
+            'creator'             => 'Source Staff',
+            'manager'             => 'Operations Manager',
+            'team_lead'           => 'Team Lead',
+            'operations_director' => 'Operations Director',
+        ];
+        return $labels[$level] ?? ucwords(str_replace('_', ' ', $level));
+    }
+
+    private static function escalation_status_label($row) {
+        if (!$row) return '';
+        if ($row->status === 'approved') return 'Approved';
+        if ($row->status === 'rejected') return 'Rejected';
+        $level = self::normalized_escalation_level($row->current_level);
+        if ($row->status === 'returned') return 'Returned to ' . self::escalation_owner_label($level);
+        return 'Pending ' . self::escalation_owner_label($level) . ' Review';
+    }
+
+    private static function can_process_escalation($row, $user_id) {
+        if (!$row || in_array($row->status, ['approved','rejected'], true)) return false;
+        $actor_level = self::normalized_escalation_level(self::user_level($user_id));
+        $case_level  = self::normalized_escalation_level($row->current_level);
+        return in_array($actor_level, ['manager','team_lead','operations_director'], true)
+            && $actor_level === $case_level;
+    }
+
+    private static function create_escalation($object_type, $object_id, $object_label, $requested_action, $reason, $severity, $notes) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'surface_operations_escalations';
+        $now = current_time('mysql');
+        $code = 'ESC-' . strtoupper(wp_generate_password(8, false, false));
+        $wpdb->insert($table, [
+            'case_code'=>$code,'object_type'=>sanitize_key($object_type),'object_id'=>sanitize_text_field((string)$object_id),
+            'object_label'=>sanitize_text_field($object_label),'requested_action'=>sanitize_key($requested_action),
+            'reason'=>sanitize_key($reason),'severity'=>sanitize_key($severity),'notes'=>sanitize_textarea_field($notes),
+            'status'=>'pending','current_level'=>self::next_escalation_level(get_current_user_id()),
+            'created_by'=>get_current_user_id(),'assigned_user_id'=>0,'created_at'=>$now,'updated_at'=>$now,
+        ], ['%s','%s','%s','%s','%s','%s','%s','%s','%s','%d','%d','%s','%s']);
+        $id = (int)$wpdb->insert_id;
+        self::audit('escalation.created','escalation',(string)$id,'Created escalation '.$code.' for '.$object_label,[
+            'object_type'=>$object_type,'object_id'=>(string)$object_id,'requested_action'=>$requested_action,'reason'=>$reason,'severity'=>$severity
+        ]);
+        self::escalation_event($id, 'created', $notes, 'creator', self::next_escalation_level(get_current_user_id()));
+        return $id;
+    }
+
+    public static function handle_escalation_actions() {
+        if (!is_user_logged_in() || !self::is_staff() || empty($_POST['surface_operations_escalation_action'])) return;
+        $user = wp_get_current_user();
+        if (!self::can_access('escalations', $user->ID)) return;
+        check_admin_referer('surface_operations_escalation','surface_operations_escalation_nonce');
+        if (!self::ensure_escalation_tables()) return;
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'surface_operations_escalations';
+        $action = sanitize_key(wp_unslash($_POST['surface_operations_escalation_action']));
+        $base = home_url('/'.self::CONSOLE_SLUG.'/');
+
+        if ($action === 'create') {
+            $type=sanitize_key(wp_unslash($_POST['object_type']??'')); $id=sanitize_text_field(wp_unslash($_POST['object_id']??''));
+            $label=sanitize_text_field(wp_unslash($_POST['object_label']??'')); $requested=sanitize_key(wp_unslash($_POST['requested_action']??'suspend'));
+            $reason=sanitize_key(wp_unslash($_POST['reason']??'other')); $severity=sanitize_key(wp_unslash($_POST['severity']??'normal'));
+            $notes=sanitize_textarea_field(wp_unslash($_POST['notes']??''));
+            $created_id = 0;
+            if ($type && $id && isset(self::escalation_reasons()[$reason])) $created_id=self::create_escalation($type,$id,$label,$requested,$reason,$severity,$notes);
+            wp_safe_redirect(add_query_arg(['soc_section'=>'escalations','view_escalation'=>$created_id,'escalation_notice'=>'created'],$base)); exit;
+        }
+
+        $eid=absint($_POST['escalation_id']??0); if(!$eid)return;
+        $row=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d",$eid));
+        if(!$row || !self::can_view_escalation($row,$user->ID)) return;
+        $notes=sanitize_textarea_field(wp_unslash($_POST['decision_notes']??''));
+        $redirect_args=['soc_section'=>'escalations','view_escalation'=>$eid];
+
+        if ($action === 'note') {
+            if ($notes === '') return;
+            self::escalation_event($eid,'note_added',$notes,$row->current_level,$row->current_level);
+            self::audit('escalation.note_added','escalation',(string)$eid,'Added note to escalation '.$row->case_code,['note'=>$notes]);
+            $wpdb->update($table,['updated_at'=>current_time('mysql')],['id'=>$eid],['%s'],['%d']);
+            $redirect_args['escalation_notice']='note_added';
+            wp_safe_redirect(add_query_arg($redirect_args,$base)); exit;
+        }
+
+        if ($action === 'resubmit') {
+            if ((int)$row->created_by !== (int)$user->ID || $row->status !== 'returned') return;
+            $new_level=self::next_escalation_level($user->ID);
+            $wpdb->update($table,['status'=>'pending','current_level'=>$new_level,'decision_notes'=>$notes,'updated_at'=>current_time('mysql')],['id'=>$eid],['%s','%s','%s','%s'],['%d']);
+            self::escalation_event($eid,'resubmitted',$notes,'creator',$new_level);
+            self::audit('escalation.resubmitted','escalation',(string)$eid,'Resubmitted escalation '.$row->case_code,['note'=>$notes,'to_level'=>$new_level]);
+            $redirect_args['escalation_notice']='resubmitted';
+            wp_safe_redirect(add_query_arg($redirect_args,$base)); exit;
+        }
+
+        if (!self::can_process_escalation($row,$user->ID)) return;
+        $new_status=$row->status; $new_level=$row->current_level; $closed=null; $event='';
+        if ($action==='forward') {
+            $current_level=self::normalized_escalation_level($row->current_level);
+            $map=['manager'=>'team_lead','team_lead'=>'operations_director'];
+            if (!isset($map[$current_level])) return;
+            $new_level=$map[$current_level]; $new_status='pending'; $event='forwarded';
+        } elseif ($action==='return') {
+            $current_level=self::normalized_escalation_level($row->current_level);
+            $back=['manager'=>'creator','team_lead'=>'manager','operations_director'=>'team_lead'];
+            $new_level=$back[$current_level]??'creator'; $new_status='returned'; $event='returned';
+        } elseif ($action==='reject' && self::can_enforce($user->ID)) {
+            $new_status='rejected'; $closed=current_time('mysql'); $event='rejected';
+        } elseif ($action==='approve' && self::can_enforce($user->ID)) {
+            self::apply_escalated_action($row); $new_status='approved'; $closed=current_time('mysql'); $event='approved';
+        } else { return; }
+
+        $data=['status'=>$new_status,'current_level'=>$new_level,'decision_notes'=>$notes,'updated_at'=>current_time('mysql')];
+        $fmt=['%s','%s','%s','%s']; if($closed){$data['closed_at']=$closed;$fmt[]='%s';}
+        $wpdb->update($table,$data,['id'=>$eid],$fmt,['%d']);
+        self::escalation_event($eid,$event,$notes,$row->current_level,$new_level);
+        self::audit('escalation.'.$event,'escalation',(string)$eid,ucfirst($event).' escalation '.$row->case_code.' from '.self::escalation_owner_label($row->current_level).' to '.self::escalation_owner_label($new_level),['decision_notes'=>$notes,'from_level'=>$row->current_level,'to_level'=>$new_level]);
+        $redirect_args['escalation_notice']=$event;
+        wp_safe_redirect(add_query_arg($redirect_args,$base)); exit;
+    }
+
+    private static function apply_escalated_action($row) {
+        global $wpdb;
+        $id=absint($row->object_id); $action=sanitize_key($row->requested_action);
+        if ($row->object_type==='partner') update_user_meta($id,'surface_operations_partner_status',$action==='reactivate'?'active':'suspended');
+        elseif ($row->object_type==='surfacetooth') update_post_meta($id,'_surface_operations_surfacetooth_status',$action==='reactivate'?'active':'suspended');
+        elseif ($row->object_type==='campaign') {
+            $t=$wpdb->prefix.'surface_campaigns'; if(self::table_exists($t))$wpdb->update($t,['status'=>$action==='reactivate'?'active':'suspended'],['id'=>$id],['%s'],['%d']);
+        } elseif ($row->object_type==='advocate') update_user_meta($id,'surface_advocate_status',$action==='reactivate'?'active':'suspended');
+        elseif ($row->object_type==='bundle') update_option('surface_operations_bundle_status_'.$id,$action==='reactivate'?'active':'suspended',false);
+        self::audit($row->object_type.'.'.($action==='reactivate'?'active':'suspended'),$row->object_type,(string)$id,'Enforcement approved through '.$row->case_code);
+    }
+
+    private static function escalation_form($type,$id,$label,$requested='suspend') {
+        ob_start(); ?>
+        <details class="soc-escalate"><summary class="soc-btn soc-btn-light">Escalate</summary><form class="soc-form" method="post" style="min-width:280px;margin-top:10px"><?php wp_nonce_field('surface_operations_escalation','surface_operations_escalation_nonce'); ?>
+        <input type="hidden" name="surface_operations_escalation_action" value="create"><input type="hidden" name="object_type" value="<?php echo esc_attr($type); ?>"><input type="hidden" name="object_id" value="<?php echo esc_attr($id); ?>"><input type="hidden" name="object_label" value="<?php echo esc_attr($label); ?>"><input type="hidden" name="requested_action" value="<?php echo esc_attr($requested); ?>">
+        <label>Reason<select name="reason"><?php foreach(self::escalation_reasons() as $k=>$v): ?><option value="<?php echo esc_attr($k); ?>"><?php echo esc_html($v); ?></option><?php endforeach; ?></select></label>
+        <label>Severity<select name="severity"><option value="normal">Normal</option><option value="high">High</option><option value="critical">Critical</option></select></label>
+        <label>Notes<textarea name="notes" required></textarea></label><button class="soc-btn" type="submit">Submit Escalation</button></form></details>
+        <?php return ob_get_clean();
+    }
+
     public static function handle_surfacetooth_actions() {
         if (!is_user_logged_in() || !self::is_staff()) return;
         if (empty($_POST['surface_operations_surfacetooth_action'])) return;
@@ -1191,7 +1459,16 @@ final class Surface_Operations_Console {
         if (!get_post_meta($post_id, '_surface_partner_user_id', true) && !$post->post_author) return;
 
         $action = sanitize_key(wp_unslash($_POST['surface_operations_surfacetooth_action']));
-        if (!in_array($action, ['suspend', 'reactivate'], true)) return;
+        if ($action === 'edit') {
+            $title=sanitize_text_field(wp_unslash($_POST['surfacetooth_title']??''));
+            $description=sanitize_textarea_field(wp_unslash($_POST['surfacetooth_description']??''));
+            $channels=sanitize_text_field(wp_unslash($_POST['surfacetooth_channels']??''));
+            if($title!=='') wp_update_post(['ID'=>$post_id,'post_title'=>$title,'post_content'=>$description]);
+            update_post_meta($post_id,'_surface_operations_channels',$channels);
+            self::audit('surfacetooth.edited','surfacetooth',(string)$post_id,'Edited SurfaceTooth: '.get_the_title($post_id),['channels'=>$channels]);
+            wp_safe_redirect(add_query_arg(['soc_section'=>'surfaceteeth','view_surfacetooth'=>$post_id,'surfacetooth_notice'=>'edited'],home_url('/'.self::CONSOLE_SLUG.'/'))); exit;
+        }
+        if (!in_array($action, ['suspend', 'reactivate'], true) || !self::can_enforce($user->ID)) return;
 
         $new_status = $action === 'suspend' ? 'suspended' : 'active';
         update_post_meta($post_id, '_surface_operations_surfacetooth_status', $new_status);
@@ -1523,9 +1800,17 @@ final class Surface_Operations_Console {
         if (!self::table_exists($table)) return;
         $campaign_id = absint($_POST['campaign_id'] ?? 0);
         $action = sanitize_key(wp_unslash($_POST['surface_operations_campaign_action']));
-        if (!$campaign_id || !in_array($action, ['suspend','reactivate'], true)) return;
+        if (!$campaign_id) return;
         $campaign = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $campaign_id));
         if (!$campaign) return;
+        if($action==='edit'){
+            $columns=$wpdb->get_col("DESC {$table}",0); $data=[];$formats=[];
+            foreach(['campaign_name'=>'%s','end_date'=>'%s','expected_winners'=>'%d'] as $field=>$format){if(in_array($field,$columns,true)&&isset($_POST[$field])){$data[$field]=$format==='%d'?absint($_POST[$field]):sanitize_text_field(wp_unslash($_POST[$field]));$formats[]=$format;}}
+            if($data)$wpdb->update($table,$data,['id'=>$campaign_id],$formats,['%d']);
+            self::audit('campaign.edited','campaign',(string)$campaign_id,'Edited campaign: '.($data['campaign_name']??$campaign->campaign_name),$data);
+            wp_safe_redirect(add_query_arg(['soc_section'=>'campaigns','view_campaign'=>$campaign_id,'campaign_notice'=>'edited'],home_url('/'.self::CONSOLE_SLUG.'/')));exit;
+        }
+        if(!in_array($action,['suspend','reactivate'],true)||!self::can_enforce($user->ID))return;
         $new_status = $action === 'suspend' ? 'suspended' : 'active';
         $wpdb->update($table, ['status'=>$new_status], ['id'=>$campaign_id], ['%s'], ['%d']);
         self::audit('campaign.'.$new_status, 'campaign', (string)$campaign_id, ucfirst($new_status).' campaign: '.$campaign->campaign_name, [
@@ -1577,7 +1862,7 @@ final class Surface_Operations_Console {
         check_admin_referer('surface_operations_advocate','surface_operations_advocate_nonce');
         $id=absint($_POST['advocate_id']??0); $a=$id?get_user_by('id',$id):false;
         if(!$a || get_user_meta($id,'surface_is_advocate',true)!=='yes') return;
-        $action=sanitize_key(wp_unslash($_POST['surface_operations_advocate_action'])); $map=['approve'=>'active','suspend'=>'suspended','reactivate'=>'active']; if(!isset($map[$action])) return;
+        $action=sanitize_key(wp_unslash($_POST['surface_operations_advocate_action'])); $map=['approve'=>'active','suspend'=>'suspended','reactivate'=>'active']; if(!isset($map[$action])) return; if(in_array($action,['suspend','reactivate'],true) && !self::can_enforce(get_current_user_id())) return;
         update_user_meta($id,'surface_advocate_status',$map[$action]); if($action==='approve') update_user_meta($id,'surface_advocate_approved_at',current_time('mysql'));
         self::audit('advocate_'.$action,'advocate',(string)$id,ucfirst($action).'d advocate: '.$a->display_name,['sii'=>self::advocate_sii($id),'status'=>$map[$action]]);
         wp_safe_redirect(add_query_arg(['soc_section'=>'advocates','advocate_notice'=>$action,'view_advocate'=>$id],home_url('/'.self::CONSOLE_SLUG.'/'))); exit;
@@ -2256,12 +2541,28 @@ final class Surface_Operations_Console {
             }
         }
 
+        $escalation_notice = sanitize_key(wp_unslash($_GET['escalation_notice'] ?? ''));
+        $view_escalation_id = absint($_GET['view_escalation'] ?? 0);
+        $view_escalation = false; $view_escalation_events = [];
+        if ($section === 'escalations' && self::ensure_escalation_tables()) {
+            global $wpdb;
+            if ($view_escalation_id) {
+                $candidate = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}surface_operations_escalations WHERE id=%d",$view_escalation_id));
+                if ($candidate && self::can_view_escalation($candidate,$user->ID)) {
+                    $view_escalation=$candidate;
+                    $view_escalation_events=self::escalation_events($view_escalation_id);
+                    self::audit('escalation.viewed','escalation',(string)$view_escalation_id,'Viewed escalation '.$candidate->case_code,['status'=>$candidate->status,'current_level'=>$candidate->current_level]);
+                    self::escalation_event($view_escalation_id,'viewed','',$candidate->current_level,$candidate->current_level);
+                }
+            }
+        }
+
         ob_start(); ?>
         <style>
         body{background:#f4f6f8!important}.soc-app{min-height:100vh;display:grid;grid-template-columns:250px 1fr;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827}.soc-sidebar{background:#111827;color:#fff;padding:26px 18px;position:sticky;top:0;height:100vh;box-sizing:border-box;display:flex;flex-direction:column;overflow:hidden}.soc-brand{font-size:19px;font-weight:800;padding:0 10px 24px}.soc-brand small{display:block;color:#9ca3af;font-size:11px;font-weight:600;margin-top:4px}.soc-nav{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}.soc-nav a{display:block;color:#cbd5e1;text-decoration:none;padding:11px 12px;border-radius:10px;margin:3px 0;font-size:14px}.soc-nav a:hover,.soc-nav a.active{background:#1f2937;color:#fff}.soc-sidebar-foot{position:static;flex:0 0 auto;border-top:1px solid #374151;padding-top:16px;margin-top:14px}.soc-sidebar-foot strong,.soc-sidebar-foot span{display:block}.soc-sidebar-foot span{font-size:12px;color:#9ca3af;margin:3px 0 10px}.soc-sidebar-foot a{color:#cbd5e1;font-size:13px}.soc-main{padding:30px}.soc-top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:25px}.soc-top h1{font-size:29px;margin:0 0 4px}.soc-top p{margin:0;color:#6b7280}.soc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.soc-stat,.soc-panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px}.soc-stat{padding:20px}.soc-stat span{display:block;color:#6b7280;font-size:13px}.soc-stat strong{display:block;font-size:30px;margin-top:7px}.soc-columns{display:grid;grid-template-columns:1.25fr .9fr;gap:18px;margin-top:18px}.soc-panel{padding:21px}.soc-panel h2{font-size:17px;margin:0 0 16px}.soc-row{display:flex;justify-content:space-between;gap:14px;padding:13px 0;border-top:1px solid #f0f1f3}.soc-row:first-of-type{border-top:0}.soc-row-title{font-weight:700;font-size:14px}.soc-meta{font-size:12px;color:#6b7280;margin-top:4px}.soc-badge{height:max-content;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:750;background:#f3f4f6}.soc-empty{color:#6b7280;font-size:14px;padding:8px 0}.soc-task-grid{display:grid;grid-template-columns:340px 1fr;gap:18px}.soc-form label{display:block;font-size:12px;font-weight:700;margin:0 0 6px}.soc-form input,.soc-form select,.soc-form textarea{width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:10px;margin:0 0 13px;background:#fff}.soc-form textarea{min-height:90px;resize:vertical}.soc-btn{border:0;border-radius:10px;background:#111827;color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}.soc-btn-light{background:#eef0f3;color:#111827}.soc-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.soc-task{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-task-head{display:flex;justify-content:space-between;gap:12px}.soc-task h3{font-size:15px;margin:0}.soc-task p{font-size:13px;color:#4b5563}.soc-inline{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.soc-inline select,.soc-inline input{margin:0}.soc-alert{padding:12px 14px;border-radius:10px;background:#ecfdf5;color:#065f46;margin-bottom:16px}.soc-comments{margin-top:13px;padding-top:12px;border-top:1px solid #eef0f2}.soc-comment{font-size:12px;padding:7px 0}.soc-comment b{display:block}.soc-overdue{color:#b91c1c;font-weight:700}.soc-filters{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:14px;padding:12px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px}.soc-filters label{font-size:12px;font-weight:700}.soc-filters select{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-filters input{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-audit-item{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-audit-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.soc-audit-summary{font-weight:750;font-size:14px}.soc-audit-details{margin-top:12px;padding-top:12px;border-top:1px solid #eef0f2;font-size:12px;color:#4b5563}.soc-audit-details code{display:block;white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:10px;border-radius:8px;margin-top:8px}.soc-audit-count{font-size:13px;color:#6b7280;margin-bottom:12px}.soc-table-wrap{overflow-x:auto}.soc-table{width:100%;border-collapse:collapse}.soc-table th,.soc-table td{text-align:left;padding:13px 10px;border-bottom:1px solid #e5e7eb;font-size:13px;vertical-align:middle}.soc-table th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#6b7280}.soc-partner-profile{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.soc-profile-field{padding:14px;background:#f8fafc;border-radius:12px}.soc-profile-field span{display:block;color:#6b7280;font-size:11px;text-transform:uppercase}.soc-profile-field strong{display:block;margin-top:5px;font-size:14px}.soc-timeline{border-left:2px solid #e5e7eb;margin-left:8px;padding-left:18px}.soc-timeline-item{margin:0 0 16px}.soc-note{background:#f8fafc;border-radius:12px;padding:13px;margin-bottom:10px}@media(max-width:900px){.soc-app{grid-template-columns:1fr}.soc-sidebar{height:auto;position:relative;overflow:visible}.soc-nav{overflow:visible;padding-right:0}.soc-sidebar-foot{position:static;margin-top:20px}.soc-main{padding:20px}.soc-grid{grid-template-columns:repeat(2,1fr)}.soc-columns,.soc-task-grid{grid-template-columns:1fr}}@media(max-width:520px){.soc-grid{grid-template-columns:1fr}}
         </style>
         <div class="soc-app"><aside class="soc-sidebar"><div class="soc-brand">Surface Operations<small>Operating the Surface Internet</small></div><nav class="soc-nav">
-        <?php $nav=['dashboard'=>'Dashboard','tasks'=>'Tasks','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth™','advocates'=>'Advocates','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','resolver'=>'Resolver','support'=>'Support','analytics'=>'Analytics','reports'=>'Reports','teams'=>'Teams','staff'=>'Staff','audit'=>'Audit']; foreach($nav as $key=>$label){if(!self::can_access($key,$user->ID))continue;$url=add_query_arg('soc_section',$key,$base_url);echo '<a class="'.($key===$section?'active':'').'" href="'.esc_url($url).'">'.esc_html($label).'</a>';} ?>
+        <?php $nav=['dashboard'=>'Dashboard','tasks'=>'Tasks','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth™','advocates'=>'Advocates','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','resolver'=>'Resolver','support'=>'Support','escalations'=>'Escalations','analytics'=>'Analytics','reports'=>'Reports','teams'=>'Teams','staff'=>'Staff','audit'=>'Audit']; foreach($nav as $key=>$label){if(!self::can_access($key,$user->ID))continue;$url=add_query_arg('soc_section',$key,$base_url);echo '<a class="'.($key===$section?'active':'').'" href="'.esc_url($url).'">'.esc_html($label).'</a>';} ?>
         </nav><div class="soc-sidebar-foot"><strong><?php echo esc_html($user->display_name); ?></strong><span><?php echo esc_html($level.' · '.$team); ?></span><a href="<?php echo esc_url($logout_url); ?>">Sign out</a></div></aside><main class="soc-main">
         <?php if($section==='tasks'): ?>
             <div class="soc-top"><div><h1>Tasks</h1><p>Assign, claim and complete operational work.</p></div></div>
@@ -2289,7 +2590,7 @@ final class Surface_Operations_Console {
             ?>
                 <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">Partner Profile</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','partners',$base_url)); ?>">Back to Partners</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Business Name</span><strong><?php echo esc_html($vp_store ?: $view_partner->display_name); ?></strong></div><div class="soc-profile-field"><span>SII</span><strong>/<?php echo esc_html(self::partner_sii($view_partner->ID) ?: 'Not assigned'); ?></strong></div><div class="soc-profile-field"><span>Owner</span><strong><?php echo esc_html($view_partner->display_name); ?></strong></div><div class="soc-profile-field"><span>Email</span><strong><?php echo esc_html($vp_email ?: 'Not available'); ?></strong></div><div class="soc-profile-field"><span>Phone</span><strong><?php echo esc_html($vp_phone ?: 'Not available'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst($vp_status)); ?></strong></div><div class="soc-profile-field"><span>SurfaceTeeth</span><strong><?php echo esc_html(self::partner_surfaceteeth_count($view_partner->ID)); ?></strong></div><div class="soc-profile-field"><span>Bundle Summary</span><strong><?php echo esc_html(self::partner_bundle_summary($view_partner->ID)); ?></strong></div><div class="soc-profile-field"><span>Wallet Balance</span><strong><?php echo esc_html(self::partner_wallet_balance($view_partner->ID)); ?></strong></div><div class="soc-profile-field"><span>Date Joined</span><strong><?php echo esc_html(mysql2date('M j, Y',$view_partner->user_registered)); ?></strong></div></div></section>
             <?php endif; ?>
-            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="partners"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="partner_search" value="<?php echo esc_attr($partner_search); ?>" placeholder="Search Partner Name, SII or Email"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','partners',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Partner</th><th>SII</th><th>SurfaceTeeth</th><th>Status</th><th>Joined</th><th>Actions</th></tr></thead><tbody><?php if(!$partners): ?><tr><td colspan="6" class="soc-empty">No partners found.</td></tr><?php endif; ?><?php foreach($partners as $partner): $ps=self::partner_status($partner->ID); $store=(string)get_user_meta($partner->ID,'surface_store',true); ?><tr><td><strong><?php echo esc_html($store ?: $partner->display_name); ?></strong><div class="soc-meta"><?php echo esc_html($partner->user_email); ?></div></td><td>/<?php echo esc_html(self::partner_sii($partner->ID) ?: '—'); ?></td><td><?php echo esc_html(self::partner_surfaceteeth_count($partner->ID)); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ps)); ?></span></td><td><?php echo esc_html(mysql2date('M j, Y',$partner->user_registered)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'partners','view_partner'=>$partner->ID],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_partner','surface_operations_partner_nonce'); ?><input type="hidden" name="partner_id" value="<?php echo esc_attr($partner->ID); ?>"><input type="hidden" name="surface_operations_partner_action" value="<?php echo esc_attr($ps==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $ps==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($ps==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="partners"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="partner_search" value="<?php echo esc_attr($partner_search); ?>" placeholder="Search Partner Name, SII or Email"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','partners',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Partner</th><th>SII</th><th>SurfaceTeeth</th><th>Status</th><th>Joined</th><th>Actions</th></tr></thead><tbody><?php if(!$partners): ?><tr><td colspan="6" class="soc-empty">No partners found.</td></tr><?php endif; ?><?php foreach($partners as $partner): $ps=self::partner_status($partner->ID); $store=(string)get_user_meta($partner->ID,'surface_store',true); ?><tr><td><strong><?php echo esc_html($store ?: $partner->display_name); ?></strong><div class="soc-meta"><?php echo esc_html($partner->user_email); ?></div></td><td>/<?php echo esc_html(self::partner_sii($partner->ID) ?: '—'); ?></td><td><?php echo esc_html(self::partner_surfaceteeth_count($partner->ID)); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ps)); ?></span></td><td><?php echo esc_html(mysql2date('M j, Y',$partner->user_registered)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'partners','view_partner'=>$partner->ID],$base_url)); ?>">View</a><?php if(self::can_enforce($user->ID)): ?><form method="post"><?php wp_nonce_field('surface_operations_partner','surface_operations_partner_nonce'); ?><input type="hidden" name="partner_id" value="<?php echo esc_attr($partner->ID); ?>"><input type="hidden" name="surface_operations_partner_action" value="<?php echo esc_attr($ps==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $ps==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($ps==='suspended'?'Reactivate':'Suspend'); ?></button></form><?php else: echo self::escalation_form('partner',$partner->ID,$store ?: $partner->display_name,$ps==='suspended'?'reactivate':'suspend'); endif; ?></div></td></tr><?php endforeach; ?></tbody></table></div></section>
         <?php elseif($section==='surfaceteeth'): ?>
             <?php
             $all_teeth=self::surface_teeth('');
@@ -2305,14 +2606,15 @@ final class Surface_Operations_Console {
                 $vt_store=$vt_partner_id?(string)get_user_meta($vt_partner_id,'surface_store',true):'';
             ?>
                 <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">SurfaceTooth Details</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Back to SurfaceTeeth</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Title</span><strong><?php echo esc_html($view_surfacetooth->post_title); ?></strong></div><div class="soc-profile-field"><span>Type</span><strong><?php echo esc_html(self::surfacetooth_type($view_surfacetooth).' SurfaceTooth'); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vt_store ?: ($vt_partner ? $vt_partner->display_name : 'Unknown partner')); ?></strong></div><div class="soc-profile-field"><span>SII</span><strong>/<?php echo esc_html(self::surfacetooth_sii($view_surfacetooth) ?: 'Not assigned'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst(self::surfacetooth_status($view_surfacetooth))); ?></strong></div><div class="soc-profile-field"><span>Channels</span><strong><?php echo esc_html(self::surfacetooth_channels($view_surfacetooth)); ?></strong></div><div class="soc-profile-field"><span>Bundle Summary</span><strong><?php echo esc_html($vt_partner_id?self::partner_bundle_summary($vt_partner_id):'Not available'); ?></strong></div><div class="soc-profile-field"><span>Created</span><strong><?php echo esc_html(mysql2date('M j, Y',$view_surfacetooth->post_date)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Description</span><strong><?php echo nl2br(esc_html(self::surfacetooth_description($view_surfacetooth) ?: 'No description available')); ?></strong></div></div></section>
+                <section class="soc-panel" style="margin-bottom:18px"><h2>Edit SurfaceTooth & Channels</h2><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_surfacetooth','surface_operations_surfacetooth_nonce'); ?><input type="hidden" name="surface_operations_surfacetooth_action" value="edit"><input type="hidden" name="surfacetooth_id" value="<?php echo esc_attr($view_surfacetooth->ID); ?>"><label>Title<input name="surfacetooth_title" value="<?php echo esc_attr($view_surfacetooth->post_title); ?>" required></label><label>Description<textarea name="surfacetooth_description"><?php echo esc_textarea(self::surfacetooth_description($view_surfacetooth)); ?></textarea></label><label>Surface Channels<input name="surfacetooth_channels" value="<?php echo esc_attr(get_post_meta($view_surfacetooth->ID,'_surface_operations_channels',true) ?: self::surfacetooth_channels($view_surfacetooth)); ?>"></label><button class="soc-btn" type="submit">Save Changes</button></form></section>
             <?php endif; ?>
-            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="surfaceteeth"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="surfacetooth_search" value="<?php echo esc_attr($surfacetooth_search); ?>" placeholder="Search title, SII or partner"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Title</th><th>Type</th><th>Partner</th><th>SII</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead><tbody><?php if(!$surfaceteeth): ?><tr><td colspan="7" class="soc-empty">No SurfaceTeeth found.</td></tr><?php endif; ?><?php foreach($surfaceteeth as $tooth): $ts=self::surfacetooth_status($tooth); $tp_id=self::surfacetooth_partner_id($tooth); $tp=$tp_id?get_user_by('id',$tp_id):false; $tp_store=$tp_id?(string)get_user_meta($tp_id,'surface_store',true):''; ?><tr><td><strong><?php echo esc_html($tooth->post_title); ?></strong></td><td><?php echo esc_html(self::surfacetooth_type($tooth)); ?></td><td><?php echo esc_html($tp_store ?: ($tp?$tp->display_name:'Unknown')); ?></td><td>/<?php echo esc_html(self::surfacetooth_sii($tooth) ?: '—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ts)); ?></span></td><td><?php echo esc_html(mysql2date('M j, Y',$tooth->post_date)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'surfaceteeth','view_surfacetooth'=>$tooth->ID],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_surfacetooth','surface_operations_surfacetooth_nonce'); ?><input type="hidden" name="surfacetooth_id" value="<?php echo esc_attr($tooth->ID); ?>"><input type="hidden" name="surface_operations_surfacetooth_action" value="<?php echo esc_attr($ts==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $ts==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($ts==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="surfaceteeth"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="surfacetooth_search" value="<?php echo esc_attr($surfacetooth_search); ?>" placeholder="Search title, SII or partner"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Title</th><th>Type</th><th>Partner</th><th>SII</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead><tbody><?php if(!$surfaceteeth): ?><tr><td colspan="7" class="soc-empty">No SurfaceTeeth found.</td></tr><?php endif; ?><?php foreach($surfaceteeth as $tooth): $ts=self::surfacetooth_status($tooth); $tp_id=self::surfacetooth_partner_id($tooth); $tp=$tp_id?get_user_by('id',$tp_id):false; $tp_store=$tp_id?(string)get_user_meta($tp_id,'surface_store',true):''; ?><tr><td><strong><?php echo esc_html($tooth->post_title); ?></strong></td><td><?php echo esc_html(self::surfacetooth_type($tooth)); ?></td><td><?php echo esc_html($tp_store ?: ($tp?$tp->display_name:'Unknown')); ?></td><td>/<?php echo esc_html(self::surfacetooth_sii($tooth) ?: '—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ts)); ?></span></td><td><?php echo esc_html(mysql2date('M j, Y',$tooth->post_date)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'surfaceteeth','view_surfacetooth'=>$tooth->ID],$base_url)); ?>">View</a><?php if(self::can_enforce($user->ID)): ?><form method="post"><?php wp_nonce_field('surface_operations_surfacetooth','surface_operations_surfacetooth_nonce'); ?><input type="hidden" name="surfacetooth_id" value="<?php echo esc_attr($tooth->ID); ?>"><input type="hidden" name="surface_operations_surfacetooth_action" value="<?php echo esc_attr($ts==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $ts==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($ts==='suspended'?'Reactivate':'Suspend'); ?></button></form><?php else: echo self::escalation_form('surfacetooth',$tooth->ID,$tooth->post_title,$ts==='suspended'?'reactivate':'suspend'); endif; ?></div></td></tr><?php endforeach; ?></tbody></table></div></section>
         <?php elseif($section==='advocates'):
             if($advocate_notice): ?><div class="soc-notice">Advocate action completed: <?php echo esc_html($advocate_notice); ?>.</div><?php endif; ?>
             <section class="soc-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:18px"><div class="soc-stat"><span>Total Advocates</span><strong><?php echo esc_html($advocate_totals['total']); ?></strong></div><div class="soc-stat"><span>Active Advocates</span><strong><?php echo esc_html($advocate_totals['active']); ?></strong></div><div class="soc-stat"><span>Pending Approval</span><strong><?php echo esc_html($advocate_totals['pending']); ?></strong></div><div class="soc-stat"><span>Suspended Advocates</span><strong><?php echo esc_html($advocate_totals['suspended']); ?></strong></div><div class="soc-stat"><span>Introduced Partners</span><strong><?php echo esc_html($advocate_totals['introduced']); ?></strong></div><div class="soc-stat"><span>Total Advocacy Earnings</span><strong>₦<?php echo esc_html(number_format($advocate_totals['earnings'],2)); ?></strong></div></section>
             <?php if($view_advocate): $st=self::advocate_status($view_advocate->ID);$sii=self::advocate_sii($view_advocate->ID);$joined=get_user_meta($view_advocate->ID,'surface_advocate_joined',true); ?>
             <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top"><div><h2>Advocate Profile</h2><p>Read-only advocacy activity and operational controls.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','advocates',$base_url)); ?>">Back to Advocates</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Name</span><strong><?php echo esc_html($view_advocate->display_name); ?></strong></div><div class="soc-profile-field"><span>SII</span><strong><?php echo esc_html($sii?'/'.$sii:'Not assigned'); ?></strong></div><div class="soc-profile-field"><span>Email</span><strong><?php echo esc_html($view_advocate->user_email?:'Not provided'); ?></strong></div><div class="soc-profile-field"><span>Phone</span><strong><?php echo esc_html(get_user_meta($view_advocate->ID,'surface_phone',true)?:'Not provided'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst($st)); ?></strong></div><div class="soc-profile-field"><span>Date Joined</span><strong><?php echo esc_html($joined?wp_date('M j, Y',(int)$joined):'Not recorded'); ?></strong></div><div class="soc-profile-field"><span>Introduced Partners</span><strong><?php echo esc_html(self::advocate_introduced($view_advocate->ID)); ?></strong></div><div class="soc-profile-field"><span>Introduced Mission Partners</span><strong><?php echo esc_html(self::advocate_introduced($view_advocate->ID,true)); ?></strong></div><div class="soc-profile-field"><span>Total Advocacy Earnings</span><strong>₦<?php echo esc_html(number_format($view_advocate_financials['earnings'],2)); ?></strong></div><div class="soc-profile-field"><span>Wallet Balance</span><strong>₦<?php echo esc_html(number_format($view_advocate_financials['balance'],2)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Referral Link</span><strong><?php echo esc_html(home_url('/surface-internet-registry/?advocate='.rawurlencode($sii))); ?></strong></div></div><div class="soc-actions" style="margin-top:16px"><form method="post"><?php wp_nonce_field('surface_operations_advocate','surface_operations_advocate_nonce'); ?><input type="hidden" name="advocate_id" value="<?php echo esc_attr($view_advocate->ID); ?>"><input type="hidden" name="surface_operations_advocate_action" value="<?php echo esc_attr($st==='pending'?'approve':($st==='suspended'?'reactivate':'suspend')); ?>"><button class="soc-btn" type="submit"><?php echo esc_html($st==='pending'?'Approve':($st==='suspended'?'Reactivate':'Suspend')); ?></button></form></div></section><?php endif; ?>
-            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="advocates"><label style="flex:1">Search<input style="width:100%" type="search" name="advocate_search" value="<?php echo esc_attr($advocate_search); ?>" placeholder="Search advocate name, phone, SII or email"></label><button class="soc-btn">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','advocates',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Advocate</th><th>Phone</th><th>SII</th><th>Status</th><th>Introduced</th><th>Mission Partners</th><th>Total Earnings</th><th>Joined</th><th>Actions</th></tr></thead><tbody><?php if(!$advocates): ?><tr><td colspan="9" class="soc-empty">No advocates found.</td></tr><?php endif; foreach($advocates as $a): $ast=self::advocate_status($a->ID);$af=self::advocate_financials($a->ID);$aj=get_user_meta($a->ID,'surface_advocate_joined',true); ?><tr><td><strong><?php echo esc_html($a->display_name); ?></strong><div class="soc-meta"><?php echo esc_html($a->user_email); ?></div></td><td><?php echo esc_html(get_user_meta($a->ID,'surface_phone',true)?:'—'); ?></td><td><?php echo esc_html(self::advocate_sii($a->ID)?'/'.self::advocate_sii($a->ID):'—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ast)); ?></span></td><td><?php echo esc_html(self::advocate_introduced($a->ID)); ?></td><td><?php echo esc_html(self::advocate_introduced($a->ID,true)); ?></td><td>₦<?php echo esc_html(number_format($af['earnings'],2)); ?></td><td><?php echo esc_html($aj?wp_date('M j, Y',(int)$aj):'—'); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'advocates','view_advocate'=>$a->ID],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_advocate','surface_operations_advocate_nonce'); ?><input type="hidden" name="advocate_id" value="<?php echo esc_attr($a->ID); ?>"><input type="hidden" name="surface_operations_advocate_action" value="<?php echo esc_attr($ast==='pending'?'approve':($ast==='suspended'?'reactivate':'suspend')); ?>"><button class="soc-btn soc-btn-light"><?php echo esc_html($ast==='pending'?'Approve':($ast==='suspended'?'Reactivate':'Suspend')); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="advocates"><label style="flex:1">Search<input style="width:100%" type="search" name="advocate_search" value="<?php echo esc_attr($advocate_search); ?>" placeholder="Search advocate name, phone, SII or email"></label><button class="soc-btn">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','advocates',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Advocate</th><th>Phone</th><th>SII</th><th>Status</th><th>Introduced</th><th>Mission Partners</th><th>Total Earnings</th><th>Joined</th><th>Actions</th></tr></thead><tbody><?php if(!$advocates): ?><tr><td colspan="9" class="soc-empty">No advocates found.</td></tr><?php endif; foreach($advocates as $a): $ast=self::advocate_status($a->ID);$af=self::advocate_financials($a->ID);$aj=get_user_meta($a->ID,'surface_advocate_joined',true); ?><tr><td><strong><?php echo esc_html($a->display_name); ?></strong><div class="soc-meta"><?php echo esc_html($a->user_email); ?></div></td><td><?php echo esc_html(get_user_meta($a->ID,'surface_phone',true)?:'—'); ?></td><td><?php echo esc_html(self::advocate_sii($a->ID)?'/'.self::advocate_sii($a->ID):'—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ast)); ?></span></td><td><?php echo esc_html(self::advocate_introduced($a->ID)); ?></td><td><?php echo esc_html(self::advocate_introduced($a->ID,true)); ?></td><td>₦<?php echo esc_html(number_format($af['earnings'],2)); ?></td><td><?php echo esc_html($aj?wp_date('M j, Y',(int)$aj):'—'); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'advocates','view_advocate'=>$a->ID],$base_url)); ?>">View</a><?php if($ast==='pending' || self::can_enforce($user->ID)): ?><form method="post"><?php wp_nonce_field('surface_operations_advocate','surface_operations_advocate_nonce'); ?><input type="hidden" name="advocate_id" value="<?php echo esc_attr($a->ID); ?>"><input type="hidden" name="surface_operations_advocate_action" value="<?php echo esc_attr($ast==='pending'?'approve':($ast==='suspended'?'reactivate':'suspend')); ?>"><button class="soc-btn soc-btn-light"><?php echo esc_html($ast==='pending'?'Approve':($ast==='suspended'?'Reactivate':'Suspend')); ?></button></form><?php else: echo self::escalation_form('advocate',$a->ID,$a->display_name,$ast==='suspended'?'reactivate':'suspend'); endif; ?></div></td></tr><?php endforeach; ?></tbody></table></div></section>
         <?php elseif($section==='campaigns'):
             $all_campaigns=self::campaigns('');
             $campaign_counts=['total'=>count($all_campaigns),'active'=>0,'scheduled'=>0,'ended'=>0,'suspended'=>0];
@@ -2328,7 +2630,64 @@ final class Surface_Operations_Console {
             ?>
                 <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">Campaign Details</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Back to Campaigns</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Campaign Name</span><strong><?php echo esc_html($view_campaign->campaign_name); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vc_partner); ?></strong></div><div class="soc-profile-field"><span>SurfaceTooth</span><strong><?php echo esc_html($vc_tooth ? $vc_tooth->post_title : 'Receipt SurfaceTooth'); ?></strong></div><div class="soc-profile-field"><span>Campaign Type</span><strong><?php echo esc_html(ucfirst((string)($view_campaign->campaign_scope ?? 'partner')).' Receipt Campaign'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst(self::campaign_status($view_campaign))); ?></strong></div><div class="soc-profile-field"><span>Start Date</span><strong><?php echo esc_html(!empty($view_campaign->preferred_start_date) ? mysql2date('M j, Y',$view_campaign->preferred_start_date) : 'Immediate'); ?></strong></div><div class="soc-profile-field"><span>End Date</span><strong><?php echo esc_html(!empty($view_campaign->end_date) ? $view_campaign->end_date : 'Not specified'); ?></strong></div><div class="soc-profile-field"><span>Target</span><strong><?php echo esc_html((string)($view_campaign->target_value ?? 'Not specified')); ?></strong></div><div class="soc-profile-field"><span>Expected Winners</span><strong><?php echo esc_html(absint($view_campaign->expected_winners ?? 0)); ?></strong></div><div class="soc-profile-field"><span>Current Winners</span><strong><?php echo esc_html($vc_counts['winners']); ?></strong></div><div class="soc-profile-field"><span>Participation Count</span><strong><?php echo esc_html($vc_counts['participation']); ?></strong></div><div class="soc-profile-field"><span>Progress</span><strong><?php echo esc_html(self::campaign_progress($view_campaign)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Cashback Configuration</span><strong><?php echo esc_html(self::campaign_cashback_summary($view_campaign->id)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Grand Cashback Configuration</span><strong><?php echo esc_html(self::campaign_grand_cashback($view_campaign)); ?></strong></div></div></section>
             <?php endif; ?>
-            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="campaigns"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="campaign_search" value="<?php echo esc_attr($campaign_search); ?>" placeholder="Search campaign, partner or SII"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Campaign</th><th>Partner</th><th>SurfaceTooth</th><th>Type</th><th>Start</th><th>End</th><th>Status</th><th>Progress</th><th>Actions</th></tr></thead><tbody><?php if(!$campaigns): ?><tr><td colspan="9" class="soc-empty">No campaigns found. Receipt campaigns will appear here when available.</td></tr><?php endif; ?><?php foreach($campaigns as $campaign): $cs=self::campaign_status($campaign);$ct=self::campaign_surfacetooth($campaign); ?><tr><td><strong><?php echo esc_html($campaign->campaign_name); ?></strong></td><td><?php echo esc_html(self::campaign_partner_name($campaign->partner_id ?? 0)); ?></td><td><?php echo esc_html($ct?$ct->post_title:'Receipt SurfaceTooth'); ?></td><td><?php echo esc_html(ucfirst((string)($campaign->campaign_scope ?? 'partner'))); ?></td><td><?php echo esc_html(!empty($campaign->preferred_start_date)?mysql2date('M j, Y',$campaign->preferred_start_date):'Immediate'); ?></td><td><?php echo esc_html(!empty($campaign->end_date)?$campaign->end_date:'—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($cs)); ?></span></td><td><?php echo esc_html(self::campaign_progress($campaign)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'campaigns','view_campaign'=>$campaign->id],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_campaign','surface_operations_campaign_nonce'); ?><input type="hidden" name="campaign_id" value="<?php echo esc_attr($campaign->id); ?>"><input type="hidden" name="surface_operations_campaign_action" value="<?php echo esc_attr($cs==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $cs==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($cs==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="campaigns"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="campaign_search" value="<?php echo esc_attr($campaign_search); ?>" placeholder="Search campaign, partner or SII"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Campaign</th><th>Partner</th><th>SurfaceTooth</th><th>Type</th><th>Start</th><th>End</th><th>Status</th><th>Progress</th><th>Actions</th></tr></thead><tbody><?php if(!$campaigns): ?><tr><td colspan="9" class="soc-empty">No campaigns found. Receipt campaigns will appear here when available.</td></tr><?php endif; ?><?php foreach($campaigns as $campaign): $cs=self::campaign_status($campaign);$ct=self::campaign_surfacetooth($campaign); ?><tr><td><strong><?php echo esc_html($campaign->campaign_name); ?></strong></td><td><?php echo esc_html(self::campaign_partner_name($campaign->partner_id ?? 0)); ?></td><td><?php echo esc_html($ct?$ct->post_title:'Receipt SurfaceTooth'); ?></td><td><?php echo esc_html(ucfirst((string)($campaign->campaign_scope ?? 'partner'))); ?></td><td><?php echo esc_html(!empty($campaign->preferred_start_date)?mysql2date('M j, Y',$campaign->preferred_start_date):'Immediate'); ?></td><td><?php echo esc_html(!empty($campaign->end_date)?$campaign->end_date:'—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($cs)); ?></span></td><td><?php echo esc_html(self::campaign_progress($campaign)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'campaigns','view_campaign'=>$campaign->id],$base_url)); ?>">View</a><?php if(self::can_enforce($user->ID)): ?><form method="post"><?php wp_nonce_field('surface_operations_campaign','surface_operations_campaign_nonce'); ?><input type="hidden" name="campaign_id" value="<?php echo esc_attr($campaign->id); ?>"><input type="hidden" name="surface_operations_campaign_action" value="<?php echo esc_attr($cs==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $cs==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($cs==='suspended'?'Reactivate':'Suspend'); ?></button></form><?php else: echo self::escalation_form('campaign',$campaign->id,$campaign->campaign_name,$cs==='suspended'?'reactivate':'suspend'); endif; ?></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+
+        <?php elseif($section==='escalations'): ?>
+            <?php
+            global $wpdb;
+            $et=$wpdb->prefix.'surface_operations_escalations';
+            $level_key=self::user_level($user->ID);
+            if(self::table_exists($et)) {
+                if(in_array($level_key,['operations_manager','team_lead','operations_director'],true)) {
+                    $escalations=$wpdb->get_results("SELECT * FROM {$et} ORDER BY created_at DESC LIMIT 300");
+                } else {
+                    $escalations=$wpdb->get_results($wpdb->prepare("SELECT * FROM {$et} WHERE created_by=%d ORDER BY created_at DESC LIMIT 300",$user->ID));
+                }
+            } else $escalations=[];
+            ?>
+            <div class="soc-top"><div><h1><?php echo in_array($level_key,['operations_manager','team_lead','operations_director'],true)?'Escalations':'My Escalations'; ?></h1><p><?php echo in_array($level_key,['operations_manager','team_lead','operations_director'],true)?'Operational review and enforcement approval queue.':'Track the issues you have escalated and any decisions or requests for more information.'; ?></p></div></div>
+            <?php if($escalation_notice): ?><div class="soc-alert">Escalation <?php echo esc_html(str_replace('_',' ',$escalation_notice)); ?>.</div><?php endif; ?>
+
+            <?php if($view_escalation): ?>
+            <section class="soc-panel" style="margin-bottom:18px">
+                <div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0"><?php echo esc_html($view_escalation->case_code); ?></h2><p>Full escalation details and activity timeline.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','escalations',$base_url)); ?>">Back to Escalations</a></div>
+                <div class="soc-alert" style="margin-bottom:16px"><strong>Current Owner:</strong> <?php echo esc_html(self::escalation_owner_label($view_escalation->current_level)); ?><br><span class="soc-meta">Staff → Operations Manager → Team Lead → Operations Director</span></div>
+                <div class="soc-partner-profile">
+                    <div class="soc-profile-field"><span>Entity</span><strong><?php echo esc_html($view_escalation->object_label ?: ucfirst($view_escalation->object_type).' #'.$view_escalation->object_id); ?></strong></div>
+                    <div class="soc-profile-field"><span>Module</span><strong><?php echo esc_html(ucfirst($view_escalation->object_type)); ?></strong></div>
+                    <div class="soc-profile-field"><span>Requested Action</span><strong><?php echo esc_html(ucfirst($view_escalation->requested_action)); ?></strong></div>
+                    <div class="soc-profile-field"><span>Reason</span><strong><?php echo esc_html(self::escalation_reasons()[$view_escalation->reason]??ucwords(str_replace('_',' ',$view_escalation->reason))); ?></strong></div>
+                    <div class="soc-profile-field"><span>Severity</span><strong><?php echo esc_html(ucfirst($view_escalation->severity)); ?></strong></div>
+                    <div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(self::escalation_status_label($view_escalation)); ?></strong></div>
+                    <div class="soc-profile-field"><span>Raised By</span><strong><?php echo esc_html(self::staff_name($view_escalation->created_by)); ?></strong></div>
+                    <div class="soc-profile-field"><span>Current Level</span><strong><?php echo esc_html(self::escalation_owner_label($view_escalation->current_level)); ?></strong></div>
+                    <div class="soc-profile-field" style="grid-column:1/-1"><span>Original Notes</span><strong><?php echo nl2br(esc_html($view_escalation->notes ?: 'No notes supplied.')); ?></strong></div>
+                </div>
+                <div class="soc-columns">
+                    <div><h2>Timeline</h2><div class="soc-timeline">
+                        <?php if(!$view_escalation_events): ?><div class="soc-empty">No timeline events recorded yet.</div><?php endif; ?>
+                        <?php foreach($view_escalation_events as $event): ?><div class="soc-timeline-item"><strong><?php echo esc_html(ucwords(str_replace('_',' ',$event->event_key))); ?></strong><div class="soc-meta"><?php echo esc_html(self::staff_name($event->actor_user_id).' · '.mysql2date('M j, Y g:i a',$event->created_at)); ?></div><?php if($event->from_level||$event->to_level): ?><div class="soc-meta"><?php echo esc_html(ucwords(str_replace('_',' ',$event->from_level)).' → '.ucwords(str_replace('_',' ',$event->to_level))); ?></div><?php endif; ?><?php if($event->event_note): ?><div class="soc-note" style="margin-top:7px"><?php echo nl2br(esc_html($event->event_note)); ?></div><?php endif; ?></div><?php endforeach; ?>
+                    </div></div>
+                    <div><h2>Actions</h2>
+                        <?php if(!in_array($view_escalation->status,['approved','rejected'],true)): ?>
+                        <form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_escalation','surface_operations_escalation_nonce'); ?><input type="hidden" name="escalation_id" value="<?php echo esc_attr($view_escalation->id); ?>"><label>Note / Decision Notes</label><textarea name="decision_notes"></textarea><div class="soc-actions">
+                            <button class="soc-btn soc-btn-light" name="surface_operations_escalation_action" value="note">Add Note</button>
+                            <?php if((int)$view_escalation->created_by===(int)$user->ID && $view_escalation->status==='returned'): ?><button class="soc-btn" name="surface_operations_escalation_action" value="resubmit">Resubmit</button><?php endif; ?>
+                            <?php if(self::can_process_escalation($view_escalation,$user->ID)): ?>
+                                <?php if(self::can_enforce($user->ID)): ?><button class="soc-btn" name="surface_operations_escalation_action" value="approve">Approve Action</button><button class="soc-btn soc-btn-light" name="surface_operations_escalation_action" value="reject">Reject</button><button class="soc-btn soc-btn-light" name="surface_operations_escalation_action" value="return">Return for Investigation</button>
+                                <?php else: ?>
+                                    <?php $action_level=self::normalized_escalation_level($view_escalation->current_level); ?>
+                                    <button class="soc-btn" name="surface_operations_escalation_action" value="forward"><?php echo esc_html($action_level==='manager'?'Forward to Team Lead':'Forward to Operations Director'); ?></button>
+                                    <button class="soc-btn soc-btn-light" name="surface_operations_escalation_action" value="return"><?php echo esc_html($action_level==='manager'?'Return to Source Staff':'Return to Operations Manager'); ?></button><?php endif; ?>
+                            <?php endif; ?>
+                        </div></form>
+                        <?php else: ?><div class="soc-empty">This escalation is closed.</div><?php endif; ?>
+                    </div>
+                </div>
+            </section>
+            <?php endif; ?>
+
+            <section class="soc-panel"><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Case</th><th>Entity</th><th>Reason</th><th>Raised By</th><th>Current Level</th><th>Status</th><th>Actions</th></tr></thead><tbody><?php if(!$escalations): ?><tr><td colspan="7" class="soc-empty">No escalations found.</td></tr><?php endif; foreach($escalations as $e): ?><tr><td><strong><?php echo esc_html($e->case_code); ?></strong><div class="soc-meta"><?php echo esc_html(mysql2date('M j, Y g:i a',$e->created_at)); ?></div></td><td><?php echo esc_html($e->object_label ?: ucfirst($e->object_type).' #'.$e->object_id); ?><div class="soc-meta"><?php echo esc_html(ucfirst($e->requested_action)); ?></div></td><td><?php echo esc_html(self::escalation_reasons()[$e->reason]??ucwords(str_replace('_',' ',$e->reason))); ?><div class="soc-meta"><?php echo esc_html(ucfirst($e->severity)); ?></div></td><td><?php echo esc_html(self::staff_name($e->created_by)); ?></td><td><?php echo esc_html(self::escalation_owner_label($e->current_level)); ?></td><td><span class="soc-badge"><?php echo esc_html(self::escalation_status_label($e)); ?></span></td><td><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'escalations','view_escalation'=>$e->id],$base_url)); ?>">View Details</a></td></tr><?php endforeach; ?></tbody></table></div></section>
 
         <?php elseif($section==='analytics'): ?>
             <div class="soc-top"><div><h1>Analytics & Insights Centre</h1><p>Leadership view of activity across Surface Internet operations.</p></div><div style="display:flex;gap:8px;flex-wrap:wrap"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(wp_nonce_url(add_query_arg(array_merge($_GET,['soc_analytics_export'=>'csv']),$base_url),'soc_analytics_export')); ?>">Export CSV</a><button class="soc-btn soc-btn-light" type="button" onclick="window.print()">Print / Save PDF</button></div></div>
