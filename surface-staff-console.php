@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.4.4
+ * Version: 1.4.5
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.4.4';
+    const VERSION = '1.4.5';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -25,6 +25,7 @@ final class Surface_Operations_Console {
         add_action('plugins_loaded', [__CLASS__, 'maybe_upgrade'], 5);
         add_action('admin_init', [__CLASS__, 'guard_staff_admin']);
         add_action('template_redirect', [__CLASS__, 'handle_front_auth'], 1);
+        add_action('template_redirect', [__CLASS__, 'handle_analytics_export'], 4);
         add_action('template_redirect', [__CLASS__, 'handle_task_actions'], 5);
         add_action('template_redirect', [__CLASS__, 'handle_partner_actions'], 6);
         add_action('template_redirect', [__CLASS__, 'handle_surfacetooth_actions'], 7);
@@ -322,14 +323,14 @@ final class Surface_Operations_Console {
 
     private static function role_permissions() {
         return [
-            'operations_director' => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','reports','teams','staff','audit'],
-            'operations_manager'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','reports','teams','staff'],
-            'team_lead'           => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','reports','teams'],
+            'operations_director' => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','analytics','reports','teams','staff','audit'],
+            'operations_manager'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','analytics','reports','teams','staff'],
+            'team_lead'           => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','analytics','reports','teams'],
             'operations_officer'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','resolver','support'],
             'finance_officer'     => ['dashboard','tasks','wallet','bundles','reports'],
             'compliance_officer'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','resolver','audit'],
             'support_officer'     => ['dashboard','tasks','partners','support'],
-            'auditor'             => ['dashboard','resolver','reports','audit'],
+            'auditor'             => ['dashboard','resolver','analytics','reports','audit'],
         ];
     }
 
@@ -2023,6 +2024,96 @@ final class Surface_Operations_Console {
         return 'Partner #' . $id;
     }
 
+
+    private static function analytics_range() {
+        $preset = sanitize_key(wp_unslash($_GET['analytics_range'] ?? '30'));
+        $today = current_time('Y-m-d');
+        if ($preset === 'today') return [$today . ' 00:00:00', $today . ' 23:59:59', 'Today'];
+        if ($preset === '7') return [date('Y-m-d 00:00:00', strtotime($today . ' -6 days')), $today . ' 23:59:59', 'Last 7 days'];
+        if ($preset === 'custom') {
+            $from = sanitize_text_field(wp_unslash($_GET['analytics_from'] ?? ''));
+            $to = sanitize_text_field(wp_unslash($_GET['analytics_to'] ?? ''));
+            if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $from) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $to)) {
+                return [$from . ' 00:00:00', $to . ' 23:59:59', $from . ' to ' . $to];
+            }
+        }
+        return [date('Y-m-d 00:00:00', strtotime($today . ' -29 days')), $today . ' 23:59:59', 'Last 30 days'];
+    }
+
+    private static function analytics_data() {
+        global $wpdb;
+        [$from,$to,$label] = self::analytics_range();
+        $partners = self::surface_partners('');
+        $teeth = self::surface_teeth('');
+        $campaigns = self::campaigns('');
+        $advocates = self::advocates('');
+        $support = self::support_summary();
+        $bundle = self::bundle_summary();
+        $wallet = self::wallet_summary();
+        $resolver = self::resolver_summary();
+
+        $daily=[];
+        for($i=0;$i<=(int)((strtotime(substr($to,0,10))-strtotime(substr($from,0,10)))/86400);$i++) {
+            $d=date('Y-m-d',strtotime(substr($from,0,10)." +{$i} days"));
+            $daily[$d]=['resolves'=>0,'partners'=>0,'support'=>0,'wallet'=>0];
+        }
+        $resolver_table=$wpdb->prefix.'surface_operations_resolver_logs';
+        if(self::table_exists($resolver_table)) {
+            $rows=$wpdb->get_results($wpdb->prepare("SELECT DATE(created_at) d,COUNT(*) c FROM {$resolver_table} WHERE created_at BETWEEN %s AND %s GROUP BY DATE(created_at)",$from,$to));
+            foreach($rows as $r) if(isset($daily[$r->d])) $daily[$r->d]['resolves']=(int)$r->c;
+        }
+        $rows=$wpdb->get_results($wpdb->prepare("SELECT DATE(user_registered) d,COUNT(*) c FROM {$wpdb->users} WHERE user_registered BETWEEN %s AND %s GROUP BY DATE(user_registered)",$from,$to));
+        foreach($rows as $r) if(isset($daily[$r->d])) $daily[$r->d]['partners']=(int)$r->c;
+        $support_table=$wpdb->prefix.'surface_operations_support_cases';
+        if(self::table_exists($support_table)) {
+            $rows=$wpdb->get_results($wpdb->prepare("SELECT DATE(created_at) d,COUNT(*) c FROM {$support_table} WHERE created_at BETWEEN %s AND %s GROUP BY DATE(created_at)",$from,$to));
+            foreach($rows as $r) if(isset($daily[$r->d])) $daily[$r->d]['support']=(int)$r->c;
+        }
+        $ledger=$wpdb->prefix.'surface_kx_wallet_ledger';
+        if(self::table_exists($ledger)) {
+            $rows=$wpdb->get_results($wpdb->prepare("SELECT DATE(created_at) d,COUNT(*) c FROM {$ledger} WHERE created_at BETWEEN %s AND %s GROUP BY DATE(created_at)",$from,$to));
+            foreach($rows as $r) if(isset($daily[$r->d])) $daily[$r->d]['wallet']=(int)$r->c;
+        }
+
+        $top_partners=[];$top_surfaces=[];
+        if(self::table_exists($resolver_table)) {
+            $top_partners=$wpdb->get_results($wpdb->prepare("SELECT partner_user_id,COUNT(*) total FROM {$resolver_table} WHERE created_at BETWEEN %s AND %s AND partner_user_id>0 GROUP BY partner_user_id ORDER BY total DESC LIMIT 5",$from,$to));
+            $top_surfaces=$wpdb->get_results($wpdb->prepare("SELECT COALESCE(NULLIF(resolved_sii,''),requested_sii) surface,COUNT(*) total FROM {$resolver_table} WHERE created_at BETWEEN %s AND %s GROUP BY surface HAVING surface<>'' ORDER BY total DESC LIMIT 5",$from,$to));
+        }
+        $audit_table=$wpdb->prefix.'surface_operations_audit';
+        $top_staff=[];
+        if(self::table_exists($audit_table)) $top_staff=$wpdb->get_results($wpdb->prepare("SELECT user_id,COUNT(*) total FROM {$audit_table} WHERE created_at BETWEEN %s AND %s AND user_id>0 GROUP BY user_id ORDER BY total DESC LIMIT 5",$from,$to));
+
+        return compact('from','to','label','partners','teeth','campaigns','advocates','support','bundle','wallet','resolver','daily','top_partners','top_surfaces','top_staff');
+    }
+
+    public static function handle_analytics_export() {
+        if (empty($_GET['soc_analytics_export']) || !is_user_logged_in() || !self::is_staff()) return;
+        if (!self::can_access('analytics', get_current_user_id())) return;
+        $nonce=sanitize_text_field(wp_unslash($_GET['_wpnonce'] ?? ''));
+        if(!wp_verify_nonce($nonce,'soc_analytics_export')) return;
+        $data=self::analytics_data();
+        self::audit('analytics_exported','analytics','summary','Exported analytics CSV',['range'=>$data['label']]);
+        nocache_headers();
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename=surface-operations-analytics-'.date('Y-m-d').'.csv');
+        $out=fopen('php://output','w');
+        fputcsv($out,['Surface Operations Analytics',$data['label']]);
+        fputcsv($out,[]);
+        fputcsv($out,['Metric','Value']);
+        fputcsv($out,['Partners',count($data['partners'])]);
+        fputcsv($out,['SurfaceTeeth',count($data['teeth'])]);
+        fputcsv($out,['Campaigns',count($data['campaigns'])]);
+        fputcsv($out,['Resolves',$data['resolver']['total']]);
+        fputcsv($out,['Wallet Credits',$data['wallet']['credits']]);
+        fputcsv($out,['Bundles', $data['bundle']['total']]);
+        fputcsv($out,['Advocates',count($data['advocates'])]);
+        fputcsv($out,['Support Cases',array_sum($data['support'])]);
+        fputcsv($out,[]); fputcsv($out,['Date','Resolves','Partner Growth','Wallet Activity','Support Cases']);
+        foreach($data['daily'] as $date=>$row) fputcsv($out,[$date,$row['resolves'],$row['partners'],$row['wallet'],$row['support']]);
+        fclose($out); exit;
+    }
+
     public static function render_console() {
         if (!is_user_logged_in() || !self::is_staff()) {
             return '<script>window.location.href=' . wp_json_encode(home_url('/' . self::LOGIN_SLUG . '/')) . ';</script>';
@@ -2148,6 +2239,8 @@ final class Surface_Operations_Console {
             if ($view_resolve && $section === 'resolver') self::audit('resolve_viewed','resolver',(string)$view_resolve->resolve_id,'Viewed resolver record: '.$view_resolve->resolve_id,['requested_sii'=>$view_resolve->requested_sii,'status'=>$view_resolve->status]);
         }
 
+        $analytics = $section === 'analytics' ? self::analytics_data() : null;
+
         $support_search = sanitize_text_field(wp_unslash($_GET['support_search'] ?? ''));
         $support_cases = $section === 'support' ? self::support_cases($support_search) : [];
         $support_totals = $section === 'support' ? self::support_summary() : array_fill_keys(array_keys(self::support_statuses()),0);
@@ -2165,10 +2258,10 @@ final class Surface_Operations_Console {
 
         ob_start(); ?>
         <style>
-        body{background:#f4f6f8!important}.soc-app{min-height:100vh;display:grid;grid-template-columns:250px 1fr;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827}.soc-sidebar{background:#111827;color:#fff;padding:26px 18px;position:sticky;top:0;height:100vh;box-sizing:border-box}.soc-brand{font-size:19px;font-weight:800;padding:0 10px 24px}.soc-brand small{display:block;color:#9ca3af;font-size:11px;font-weight:600;margin-top:4px}.soc-nav a{display:block;color:#cbd5e1;text-decoration:none;padding:11px 12px;border-radius:10px;margin:3px 0;font-size:14px}.soc-nav a:hover,.soc-nav a.active{background:#1f2937;color:#fff}.soc-sidebar-foot{position:absolute;left:18px;right:18px;bottom:22px;border-top:1px solid #374151;padding-top:16px}.soc-sidebar-foot strong,.soc-sidebar-foot span{display:block}.soc-sidebar-foot span{font-size:12px;color:#9ca3af;margin:3px 0 10px}.soc-sidebar-foot a{color:#cbd5e1;font-size:13px}.soc-main{padding:30px}.soc-top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:25px}.soc-top h1{font-size:29px;margin:0 0 4px}.soc-top p{margin:0;color:#6b7280}.soc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.soc-stat,.soc-panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px}.soc-stat{padding:20px}.soc-stat span{display:block;color:#6b7280;font-size:13px}.soc-stat strong{display:block;font-size:30px;margin-top:7px}.soc-columns{display:grid;grid-template-columns:1.25fr .9fr;gap:18px;margin-top:18px}.soc-panel{padding:21px}.soc-panel h2{font-size:17px;margin:0 0 16px}.soc-row{display:flex;justify-content:space-between;gap:14px;padding:13px 0;border-top:1px solid #f0f1f3}.soc-row:first-of-type{border-top:0}.soc-row-title{font-weight:700;font-size:14px}.soc-meta{font-size:12px;color:#6b7280;margin-top:4px}.soc-badge{height:max-content;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:750;background:#f3f4f6}.soc-empty{color:#6b7280;font-size:14px;padding:8px 0}.soc-task-grid{display:grid;grid-template-columns:340px 1fr;gap:18px}.soc-form label{display:block;font-size:12px;font-weight:700;margin:0 0 6px}.soc-form input,.soc-form select,.soc-form textarea{width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:10px;margin:0 0 13px;background:#fff}.soc-form textarea{min-height:90px;resize:vertical}.soc-btn{border:0;border-radius:10px;background:#111827;color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}.soc-btn-light{background:#eef0f3;color:#111827}.soc-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.soc-task{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-task-head{display:flex;justify-content:space-between;gap:12px}.soc-task h3{font-size:15px;margin:0}.soc-task p{font-size:13px;color:#4b5563}.soc-inline{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.soc-inline select,.soc-inline input{margin:0}.soc-alert{padding:12px 14px;border-radius:10px;background:#ecfdf5;color:#065f46;margin-bottom:16px}.soc-comments{margin-top:13px;padding-top:12px;border-top:1px solid #eef0f2}.soc-comment{font-size:12px;padding:7px 0}.soc-comment b{display:block}.soc-overdue{color:#b91c1c;font-weight:700}.soc-filters{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:14px;padding:12px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px}.soc-filters label{font-size:12px;font-weight:700}.soc-filters select{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-filters input{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-audit-item{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-audit-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.soc-audit-summary{font-weight:750;font-size:14px}.soc-audit-details{margin-top:12px;padding-top:12px;border-top:1px solid #eef0f2;font-size:12px;color:#4b5563}.soc-audit-details code{display:block;white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:10px;border-radius:8px;margin-top:8px}.soc-audit-count{font-size:13px;color:#6b7280;margin-bottom:12px}.soc-table-wrap{overflow-x:auto}.soc-table{width:100%;border-collapse:collapse}.soc-table th,.soc-table td{text-align:left;padding:13px 10px;border-bottom:1px solid #e5e7eb;font-size:13px;vertical-align:middle}.soc-table th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#6b7280}.soc-partner-profile{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.soc-profile-field{padding:14px;background:#f8fafc;border-radius:12px}.soc-profile-field span{display:block;color:#6b7280;font-size:11px;text-transform:uppercase}.soc-profile-field strong{display:block;margin-top:5px;font-size:14px}.soc-timeline{border-left:2px solid #e5e7eb;margin-left:8px;padding-left:18px}.soc-timeline-item{margin:0 0 16px}.soc-note{background:#f8fafc;border-radius:12px;padding:13px;margin-bottom:10px}@media(max-width:900px){.soc-app{grid-template-columns:1fr}.soc-sidebar{height:auto;position:relative}.soc-sidebar-foot{position:static;margin-top:20px}.soc-main{padding:20px}.soc-grid{grid-template-columns:repeat(2,1fr)}.soc-columns,.soc-task-grid{grid-template-columns:1fr}}@media(max-width:520px){.soc-grid{grid-template-columns:1fr}}
+        body{background:#f4f6f8!important}.soc-app{min-height:100vh;display:grid;grid-template-columns:250px 1fr;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827}.soc-sidebar{background:#111827;color:#fff;padding:26px 18px;position:sticky;top:0;height:100vh;box-sizing:border-box;display:flex;flex-direction:column;overflow:hidden}.soc-brand{font-size:19px;font-weight:800;padding:0 10px 24px}.soc-brand small{display:block;color:#9ca3af;font-size:11px;font-weight:600;margin-top:4px}.soc-nav{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}.soc-nav a{display:block;color:#cbd5e1;text-decoration:none;padding:11px 12px;border-radius:10px;margin:3px 0;font-size:14px}.soc-nav a:hover,.soc-nav a.active{background:#1f2937;color:#fff}.soc-sidebar-foot{position:static;flex:0 0 auto;border-top:1px solid #374151;padding-top:16px;margin-top:14px}.soc-sidebar-foot strong,.soc-sidebar-foot span{display:block}.soc-sidebar-foot span{font-size:12px;color:#9ca3af;margin:3px 0 10px}.soc-sidebar-foot a{color:#cbd5e1;font-size:13px}.soc-main{padding:30px}.soc-top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:25px}.soc-top h1{font-size:29px;margin:0 0 4px}.soc-top p{margin:0;color:#6b7280}.soc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.soc-stat,.soc-panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px}.soc-stat{padding:20px}.soc-stat span{display:block;color:#6b7280;font-size:13px}.soc-stat strong{display:block;font-size:30px;margin-top:7px}.soc-columns{display:grid;grid-template-columns:1.25fr .9fr;gap:18px;margin-top:18px}.soc-panel{padding:21px}.soc-panel h2{font-size:17px;margin:0 0 16px}.soc-row{display:flex;justify-content:space-between;gap:14px;padding:13px 0;border-top:1px solid #f0f1f3}.soc-row:first-of-type{border-top:0}.soc-row-title{font-weight:700;font-size:14px}.soc-meta{font-size:12px;color:#6b7280;margin-top:4px}.soc-badge{height:max-content;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:750;background:#f3f4f6}.soc-empty{color:#6b7280;font-size:14px;padding:8px 0}.soc-task-grid{display:grid;grid-template-columns:340px 1fr;gap:18px}.soc-form label{display:block;font-size:12px;font-weight:700;margin:0 0 6px}.soc-form input,.soc-form select,.soc-form textarea{width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:10px;margin:0 0 13px;background:#fff}.soc-form textarea{min-height:90px;resize:vertical}.soc-btn{border:0;border-radius:10px;background:#111827;color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}.soc-btn-light{background:#eef0f3;color:#111827}.soc-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.soc-task{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-task-head{display:flex;justify-content:space-between;gap:12px}.soc-task h3{font-size:15px;margin:0}.soc-task p{font-size:13px;color:#4b5563}.soc-inline{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.soc-inline select,.soc-inline input{margin:0}.soc-alert{padding:12px 14px;border-radius:10px;background:#ecfdf5;color:#065f46;margin-bottom:16px}.soc-comments{margin-top:13px;padding-top:12px;border-top:1px solid #eef0f2}.soc-comment{font-size:12px;padding:7px 0}.soc-comment b{display:block}.soc-overdue{color:#b91c1c;font-weight:700}.soc-filters{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:14px;padding:12px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px}.soc-filters label{font-size:12px;font-weight:700}.soc-filters select{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-filters input{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-audit-item{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-audit-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.soc-audit-summary{font-weight:750;font-size:14px}.soc-audit-details{margin-top:12px;padding-top:12px;border-top:1px solid #eef0f2;font-size:12px;color:#4b5563}.soc-audit-details code{display:block;white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:10px;border-radius:8px;margin-top:8px}.soc-audit-count{font-size:13px;color:#6b7280;margin-bottom:12px}.soc-table-wrap{overflow-x:auto}.soc-table{width:100%;border-collapse:collapse}.soc-table th,.soc-table td{text-align:left;padding:13px 10px;border-bottom:1px solid #e5e7eb;font-size:13px;vertical-align:middle}.soc-table th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#6b7280}.soc-partner-profile{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.soc-profile-field{padding:14px;background:#f8fafc;border-radius:12px}.soc-profile-field span{display:block;color:#6b7280;font-size:11px;text-transform:uppercase}.soc-profile-field strong{display:block;margin-top:5px;font-size:14px}.soc-timeline{border-left:2px solid #e5e7eb;margin-left:8px;padding-left:18px}.soc-timeline-item{margin:0 0 16px}.soc-note{background:#f8fafc;border-radius:12px;padding:13px;margin-bottom:10px}@media(max-width:900px){.soc-app{grid-template-columns:1fr}.soc-sidebar{height:auto;position:relative;overflow:visible}.soc-nav{overflow:visible;padding-right:0}.soc-sidebar-foot{position:static;margin-top:20px}.soc-main{padding:20px}.soc-grid{grid-template-columns:repeat(2,1fr)}.soc-columns,.soc-task-grid{grid-template-columns:1fr}}@media(max-width:520px){.soc-grid{grid-template-columns:1fr}}
         </style>
         <div class="soc-app"><aside class="soc-sidebar"><div class="soc-brand">Surface Operations<small>Operating the Surface Internet</small></div><nav class="soc-nav">
-        <?php $nav=['dashboard'=>'Dashboard','tasks'=>'Tasks','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth™','advocates'=>'Advocates','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','resolver'=>'Resolver','support'=>'Support','reports'=>'Reports','teams'=>'Teams','staff'=>'Staff','audit'=>'Audit']; foreach($nav as $key=>$label){if(!self::can_access($key,$user->ID))continue;$url=add_query_arg('soc_section',$key,$base_url);echo '<a class="'.($key===$section?'active':'').'" href="'.esc_url($url).'">'.esc_html($label).'</a>';} ?>
+        <?php $nav=['dashboard'=>'Dashboard','tasks'=>'Tasks','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth™','advocates'=>'Advocates','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','resolver'=>'Resolver','support'=>'Support','analytics'=>'Analytics','reports'=>'Reports','teams'=>'Teams','staff'=>'Staff','audit'=>'Audit']; foreach($nav as $key=>$label){if(!self::can_access($key,$user->ID))continue;$url=add_query_arg('soc_section',$key,$base_url);echo '<a class="'.($key===$section?'active':'').'" href="'.esc_url($url).'">'.esc_html($label).'</a>';} ?>
         </nav><div class="soc-sidebar-foot"><strong><?php echo esc_html($user->display_name); ?></strong><span><?php echo esc_html($level.' · '.$team); ?></span><a href="<?php echo esc_url($logout_url); ?>">Sign out</a></div></aside><main class="soc-main">
         <?php if($section==='tasks'): ?>
             <div class="soc-top"><div><h1>Tasks</h1><p>Assign, claim and complete operational work.</p></div></div>
@@ -2236,6 +2329,15 @@ final class Surface_Operations_Console {
                 <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">Campaign Details</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Back to Campaigns</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Campaign Name</span><strong><?php echo esc_html($view_campaign->campaign_name); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vc_partner); ?></strong></div><div class="soc-profile-field"><span>SurfaceTooth</span><strong><?php echo esc_html($vc_tooth ? $vc_tooth->post_title : 'Receipt SurfaceTooth'); ?></strong></div><div class="soc-profile-field"><span>Campaign Type</span><strong><?php echo esc_html(ucfirst((string)($view_campaign->campaign_scope ?? 'partner')).' Receipt Campaign'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst(self::campaign_status($view_campaign))); ?></strong></div><div class="soc-profile-field"><span>Start Date</span><strong><?php echo esc_html(!empty($view_campaign->preferred_start_date) ? mysql2date('M j, Y',$view_campaign->preferred_start_date) : 'Immediate'); ?></strong></div><div class="soc-profile-field"><span>End Date</span><strong><?php echo esc_html(!empty($view_campaign->end_date) ? $view_campaign->end_date : 'Not specified'); ?></strong></div><div class="soc-profile-field"><span>Target</span><strong><?php echo esc_html((string)($view_campaign->target_value ?? 'Not specified')); ?></strong></div><div class="soc-profile-field"><span>Expected Winners</span><strong><?php echo esc_html(absint($view_campaign->expected_winners ?? 0)); ?></strong></div><div class="soc-profile-field"><span>Current Winners</span><strong><?php echo esc_html($vc_counts['winners']); ?></strong></div><div class="soc-profile-field"><span>Participation Count</span><strong><?php echo esc_html($vc_counts['participation']); ?></strong></div><div class="soc-profile-field"><span>Progress</span><strong><?php echo esc_html(self::campaign_progress($view_campaign)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Cashback Configuration</span><strong><?php echo esc_html(self::campaign_cashback_summary($view_campaign->id)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Grand Cashback Configuration</span><strong><?php echo esc_html(self::campaign_grand_cashback($view_campaign)); ?></strong></div></div></section>
             <?php endif; ?>
             <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="campaigns"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="campaign_search" value="<?php echo esc_attr($campaign_search); ?>" placeholder="Search campaign, partner or SII"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Campaign</th><th>Partner</th><th>SurfaceTooth</th><th>Type</th><th>Start</th><th>End</th><th>Status</th><th>Progress</th><th>Actions</th></tr></thead><tbody><?php if(!$campaigns): ?><tr><td colspan="9" class="soc-empty">No campaigns found. Receipt campaigns will appear here when available.</td></tr><?php endif; ?><?php foreach($campaigns as $campaign): $cs=self::campaign_status($campaign);$ct=self::campaign_surfacetooth($campaign); ?><tr><td><strong><?php echo esc_html($campaign->campaign_name); ?></strong></td><td><?php echo esc_html(self::campaign_partner_name($campaign->partner_id ?? 0)); ?></td><td><?php echo esc_html($ct?$ct->post_title:'Receipt SurfaceTooth'); ?></td><td><?php echo esc_html(ucfirst((string)($campaign->campaign_scope ?? 'partner'))); ?></td><td><?php echo esc_html(!empty($campaign->preferred_start_date)?mysql2date('M j, Y',$campaign->preferred_start_date):'Immediate'); ?></td><td><?php echo esc_html(!empty($campaign->end_date)?$campaign->end_date:'—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($cs)); ?></span></td><td><?php echo esc_html(self::campaign_progress($campaign)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'campaigns','view_campaign'=>$campaign->id],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_campaign','surface_operations_campaign_nonce'); ?><input type="hidden" name="campaign_id" value="<?php echo esc_attr($campaign->id); ?>"><input type="hidden" name="surface_operations_campaign_action" value="<?php echo esc_attr($cs==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $cs==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($cs==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+
+        <?php elseif($section==='analytics'): ?>
+            <div class="soc-top"><div><h1>Analytics & Insights Centre</h1><p>Leadership view of activity across Surface Internet operations.</p></div><div style="display:flex;gap:8px;flex-wrap:wrap"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(wp_nonce_url(add_query_arg(array_merge($_GET,['soc_analytics_export'=>'csv']),$base_url),'soc_analytics_export')); ?>">Export CSV</a><button class="soc-btn soc-btn-light" type="button" onclick="window.print()">Print / Save PDF</button></div></div>
+            <section class="soc-panel" style="margin-bottom:18px"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="analytics"><label>Range<select name="analytics_range"><option value="today" <?php selected($_GET['analytics_range']??'','today'); ?>>Today</option><option value="7" <?php selected($_GET['analytics_range']??'','7'); ?>>Last 7 days</option><option value="30" <?php selected($_GET['analytics_range']??'30','30'); ?>>Last 30 days</option><option value="custom" <?php selected($_GET['analytics_range']??'','custom'); ?>>Custom</option></select></label><label>From<input type="date" name="analytics_from" value="<?php echo esc_attr($_GET['analytics_from']??''); ?>"></label><label>To<input type="date" name="analytics_to" value="<?php echo esc_attr($_GET['analytics_to']??''); ?>"></label><button class="soc-btn">Apply</button></form><div class="soc-meta" style="margin-top:10px">Showing <?php echo esc_html($analytics['label']); ?></div></section>
+            <section class="soc-grid" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:18px"><div class="soc-stat"><span>Partners</span><strong><?php echo esc_html(count($analytics['partners'])); ?></strong></div><div class="soc-stat"><span>SurfaceTeeth</span><strong><?php echo esc_html(count($analytics['teeth'])); ?></strong></div><div class="soc-stat"><span>Campaigns</span><strong><?php echo esc_html(count($analytics['campaigns'])); ?></strong></div><div class="soc-stat"><span>Resolves</span><strong><?php echo esc_html($analytics['resolver']['total']); ?></strong></div><div class="soc-stat"><span>Wallet Transactions</span><strong><?php echo esc_html($analytics['wallet']['credits']+$analytics['wallet']['debits']); ?></strong></div><div class="soc-stat"><span>Bundles</span><strong><?php echo esc_html($analytics['bundle']['total']); ?></strong></div><div class="soc-stat"><span>Advocates</span><strong><?php echo esc_html(count($analytics['advocates'])); ?></strong></div><div class="soc-stat"><span>Support Cases</span><strong><?php echo esc_html(array_sum($analytics['support'])); ?></strong></div></section>
+            <section class="soc-panel" style="margin-bottom:18px"><h2>Daily Operational Activity</h2><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Date</th><th>Resolves</th><th>Partner Growth</th><th>Wallet Activity</th><th>Support Cases</th></tr></thead><tbody><?php foreach($analytics['daily'] as $date=>$row): ?><tr><td><?php echo esc_html(mysql2date('M j', $date)); ?></td><td><?php echo esc_html($row['resolves']); ?></td><td><?php echo esc_html($row['partners']); ?></td><td><?php echo esc_html($row['wallet']); ?></td><td><?php echo esc_html($row['support']); ?></td></tr><?php endforeach; ?></tbody></table></div></section>
+            <section class="soc-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:18px"><div class="soc-panel"><h2>Top Partners</h2><?php if(!$analytics['top_partners']): ?><p class="soc-empty">No resolve activity in this range.</p><?php endif; foreach($analytics['top_partners'] as $row): ?><p><strong><?php echo esc_html(self::resolver_partner_name($row->partner_user_id)); ?></strong><span style="float:right"><?php echo esc_html($row->total); ?> resolves</span></p><?php endforeach; ?></div><div class="soc-panel"><h2>Top SurfaceTeeth</h2><?php if(!$analytics['top_surfaces']): ?><p class="soc-empty">No resolve activity in this range.</p><?php endif; foreach($analytics['top_surfaces'] as $row): ?><p><strong><?php echo esc_html($row->surface?:'Unknown'); ?></strong><span style="float:right"><?php echo esc_html($row->total); ?> resolves</span></p><?php endforeach; ?></div><div class="soc-panel"><h2>Most Active Staff</h2><?php if(!$analytics['top_staff']): ?><p class="soc-empty">No audited staff activity in this range.</p><?php endif; foreach($analytics['top_staff'] as $row): $member=get_user_by('id',$row->user_id); ?><p><strong><?php echo esc_html($member?$member->display_name:'Staff #'.$row->user_id); ?></strong><span style="float:right"><?php echo esc_html($row->total); ?> actions</span></p><?php endforeach; ?></div></section>
+            <section class="soc-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))"><div class="soc-panel"><h2>Bundle Consumption</h2><p><strong>Used:</strong> <?php echo esc_html(size_format($analytics['bundle']['used']*1024*1024)); ?></p><p><strong>Remaining:</strong> <?php echo esc_html(size_format($analytics['bundle']['remaining']*1024*1024)); ?></p></div><div class="soc-panel"><h2>Wallet Activity</h2><p><strong>Credits:</strong> <?php echo esc_html(number_format_i18n($analytics['wallet']['credits'],2)); ?></p><p><strong>Debits:</strong> <?php echo esc_html(number_format_i18n($analytics['wallet']['debits'],2)); ?></p></div><div class="soc-panel"><h2>Support Health</h2><p><strong>Open:</strong> <?php echo esc_html(($analytics['support']['open']??0)+($analytics['support']['in_progress']??0)); ?></p><p><strong>Resolved / Closed:</strong> <?php echo esc_html(($analytics['support']['resolved']??0)+($analytics['support']['closed']??0)); ?></p></div></section>
+
         <?php elseif($section==='support'): ?>
             <div class="soc-top"><div><h1>Support & Case Management</h1><p>Manage partner and customer operational cases in one audited workspace.</p></div></div>
             <?php if($support_notice): ?><div class="soc-alert">Support case action completed.</div><?php endif; ?>
