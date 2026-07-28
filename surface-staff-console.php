@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.3.3
+ * Version: 1.3.4
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.3.3';
+    const VERSION = '1.3.4';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -411,6 +411,41 @@ final class Surface_Operations_Console {
             add_settings_error('surface_operations_tasks', 'task_updated', 'Task status updated.', 'success');
         }
 
+        if ($action === 'reassign') {
+            $task_id = absint($_POST['task_id'] ?? 0);
+            $user_id = absint($_POST['task_user_id'] ?? 0);
+            $team = sanitize_text_field(wp_unslash($_POST['task_team'] ?? ''));
+            $task = $task_id ? $wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $task_id)) : null;
+
+            if (!$task) {
+                add_settings_error('surface_operations_tasks', 'task_missing', 'Task could not be found.', 'error');
+                return;
+            }
+
+            if ($user_id) {
+                $assigned_user = get_user_by('id', $user_id);
+                if (!$assigned_user || !self::is_staff($assigned_user) || self::staff_status($user_id) === 'suspended') {
+                    add_settings_error('surface_operations_tasks', 'task_assignee', 'Select an active staff member.', 'error');
+                    return;
+                }
+                $team = self::user_team($user_id);
+            }
+
+            $wpdb->update(
+                $table,
+                [
+                    'assigned_user_id' => $user_id ?: null,
+                    'assigned_team'    => $team,
+                    'updated_at'       => current_time('mysql'),
+                ],
+                ['id' => $task_id],
+                ['%d','%s','%s'],
+                ['%d']
+            );
+            self::audit('task.reassigned','task',(string)$task_id,'Administrator reassigned task: '.$task->title);
+            add_settings_error('surface_operations_tasks', 'task_reassigned', 'Task assignment updated.', 'success');
+        }
+
         if ($action === 'delete') {
             $task_id = absint($_POST['task_id'] ?? 0);
             $wpdb->delete($table, ['id'=>$task_id], ['%d']);
@@ -426,11 +461,31 @@ final class Surface_Operations_Console {
         $task_tables_ready = self::ensure_task_tables();
         $table = $wpdb->prefix . 'surface_operations_tasks';
         $filter = sanitize_key(wp_unslash($_GET['task_status'] ?? 'all'));
-        $where = in_array($filter, ['open','in_progress','completed'], true)
-            ? $wpdb->prepare(' WHERE status=%s', $filter) : '';
-        $tasks = $task_tables_ready
-            ? $wpdb->get_results("SELECT * FROM {$table}{$where} ORDER BY CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END, id DESC LIMIT 200")
-            : [];
+        $filter_priority = sanitize_key(wp_unslash($_GET['task_priority'] ?? 'all'));
+        $filter_team = sanitize_text_field(wp_unslash($_GET['task_team'] ?? ''));
+        $filter_user = absint($_GET['task_user_id'] ?? 0);
+        $conditions = [];
+        $query_args = [];
+        if (in_array($filter, ['open','in_progress','completed'], true)) {
+            $conditions[] = 'status=%s';
+            $query_args[] = $filter;
+        }
+        if (in_array($filter_priority, ['low','normal','high','urgent'], true)) {
+            $conditions[] = 'priority=%s';
+            $query_args[] = $filter_priority;
+        }
+        if ($filter_team !== '') {
+            $conditions[] = 'assigned_team=%s';
+            $query_args[] = $filter_team;
+        }
+        if ($filter_user) {
+            $conditions[] = 'assigned_user_id=%d';
+            $query_args[] = $filter_user;
+        }
+        $where = $conditions ? ' WHERE '.implode(' AND ', $conditions) : '';
+        $sql = "SELECT * FROM {$table}{$where} ORDER BY CASE status WHEN 'open' THEN 1 WHEN 'in_progress' THEN 2 ELSE 3 END, CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END, id DESC LIMIT 200";
+        if ($query_args) $sql = $wpdb->prepare($sql, $query_args);
+        $tasks = $task_tables_ready ? $wpdb->get_results($sql) : [];
         $staff = get_users(['role'=>self::ROLE,'orderby'=>'display_name','order'=>'ASC']);
         settings_errors('surface_operations_tasks');
         ?>
@@ -455,7 +510,14 @@ final class Surface_Operations_Console {
                     </form>
                 </div>
                 <div>
-                    <div style="margin-bottom:14px;"><a class="button <?php echo $filter==='all'?'button-primary':''; ?>" href="<?php echo esc_url(admin_url('admin.php?page=surface-operations-tasks')); ?>">All</a> <a class="button <?php echo $filter==='open'?'button-primary':''; ?>" href="<?php echo esc_url(add_query_arg(['page'=>'surface-operations-tasks','task_status'=>'open'],admin_url('admin.php'))); ?>">Open</a> <a class="button <?php echo $filter==='in_progress'?'button-primary':''; ?>" href="<?php echo esc_url(add_query_arg(['page'=>'surface-operations-tasks','task_status'=>'in_progress'],admin_url('admin.php'))); ?>">In Progress</a> <a class="button <?php echo $filter==='completed'?'button-primary':''; ?>" href="<?php echo esc_url(add_query_arg(['page'=>'surface-operations-tasks','task_status'=>'completed'],admin_url('admin.php'))); ?>">Completed</a></div>
+                    <form method="get" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:14px;background:#fff;border:1px solid #dcdcde;padding:12px;">
+                        <input type="hidden" name="page" value="surface-operations-tasks">
+                        <label><strong>Status</strong><br><select name="task_status"><option value="all">All</option><option value="open" <?php selected($filter,'open'); ?>>Open</option><option value="in_progress" <?php selected($filter,'in_progress'); ?>>In Progress</option><option value="completed" <?php selected($filter,'completed'); ?>>Completed</option></select></label>
+                        <label><strong>Priority</strong><br><select name="task_priority"><option value="all">All</option><?php foreach(['low'=>'Low','normal'=>'Normal','high'=>'High','urgent'=>'Urgent'] as $k=>$v) echo '<option value="'.esc_attr($k).'" '.selected($filter_priority,$k,false).'>'.esc_html($v).'</option>'; ?></select></label>
+                        <label><strong>Team</strong><br><select name="task_team"><option value="">All teams</option><?php foreach(self::teams() as $team) echo '<option value="'.esc_attr($team).'" '.selected($filter_team,$team,false).'>'.esc_html($team).'</option>'; ?></select></label>
+                        <label><strong>Staff</strong><br><select name="task_user_id"><option value="0">All staff</option><?php foreach($staff as $member) echo '<option value="'.esc_attr($member->ID).'" '.selected($filter_user,$member->ID,false).'>'.esc_html($member->display_name).'</option>'; ?></select></label>
+                        <button class="button button-primary" type="submit">Filter</button><a class="button" href="<?php echo esc_url(admin_url('admin.php?page=surface-operations-tasks')); ?>">Reset</a>
+                    </form>
                     <?php if(!$tasks): ?><div class="notice notice-info inline"><p>No tasks found.</p></div><?php endif; ?>
                     <?php foreach($tasks as $task): ?>
                         <div class="postbox" style="padding:16px;margin-bottom:12px;">
@@ -465,6 +527,11 @@ final class Surface_Operations_Console {
                             </div>
                             <?php if($task->description): ?><p><?php echo nl2br(esc_html($task->description)); ?></p><?php endif; ?>
                             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                                <form method="post" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                                    <?php wp_nonce_field('surface_admin_task_action','surface_admin_task_nonce'); ?><input type="hidden" name="surface_admin_task_action" value="reassign"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>">
+                                    <select name="task_user_id"><option value="0">Team queue</option><?php foreach($staff as $member){ if(self::staff_status($member->ID)==='suspended') continue; echo '<option value="'.esc_attr($member->ID).'" '.selected((int)$task->assigned_user_id,$member->ID,false).'>'.esc_html($member->display_name).'</option>'; } ?></select>
+                                    <select name="task_team"><option value="">No team</option><?php foreach(self::teams() as $team) echo '<option value="'.esc_attr($team).'" '.selected((string)$task->assigned_team,$team,false).'>'.esc_html($team).'</option>'; ?></select><button class="button" type="submit">Reassign</button>
+                                </form>
                                 <form method="post" style="display:flex;gap:8px;align-items:center;">
                                     <?php wp_nonce_field('surface_admin_task_action','surface_admin_task_nonce'); ?><input type="hidden" name="surface_admin_task_action" value="status"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>">
                                     <select name="task_status"><option value="open" <?php selected($task->status,'open'); ?>>Open</option><option value="in_progress" <?php selected($task->status,'in_progress'); ?>>In Progress</option><option value="completed" <?php selected($task->status,'completed'); ?>>Completed</option></select><button class="button" type="submit">Update</button>
@@ -823,7 +890,7 @@ final class Surface_Operations_Console {
             }
         }
 
-        if (in_array($action, ['status','claim','comment'], true)) {
+        if (in_array($action, ['status','claim','comment','reassign'], true)) {
             $task_id = absint($_POST['task_id'] ?? 0);
             $task = $task_id ? $wpdb->get_row($wpdb->prepare("SELECT * FROM {$tasks} WHERE id=%d", $task_id)) : null;
             if ($task && self::can_work_task($task, $user->ID, $team)) {
@@ -840,6 +907,25 @@ final class Surface_Operations_Console {
                         self::audit('task.status','task',(string)$task_id,'Changed task status to ' . str_replace('_',' ',$status) . ': ' . $task->title);
                         $redirect = add_query_arg('task_notice','updated',$redirect);
                     }
+                }
+                if ($action === 'reassign' && self::can_manage_tasks($user->ID)) {
+                    $assigned_user_id = absint($_POST['task_user_id'] ?? 0);
+                    $assigned_team = sanitize_text_field(wp_unslash($_POST['task_team'] ?? ''));
+                    if ($assigned_user_id) {
+                        $assigned_user = get_user_by('id', $assigned_user_id);
+                        if (!$assigned_user || !self::is_staff($assigned_user) || self::staff_status($assigned_user_id) === 'suspended') {
+                            $assigned_user_id = 0;
+                        } else {
+                            $assigned_team = self::user_team($assigned_user_id);
+                        }
+                    }
+                    $wpdb->update($tasks,[
+                        'assigned_user_id'=>$assigned_user_id ?: null,
+                        'assigned_team'=>$assigned_team,
+                        'updated_at'=>current_time('mysql')
+                    ],['id'=>$task_id],['%d','%s','%s'],['%d']);
+                    self::audit('task.reassigned','task',(string)$task_id,'Reassigned task: '.$task->title);
+                    $redirect = add_query_arg('task_notice','reassigned',$redirect);
                 }
                 if ($action === 'comment') {
                     $comment = sanitize_textarea_field(wp_unslash($_POST['task_comment'] ?? ''));
@@ -876,10 +962,16 @@ final class Surface_Operations_Console {
         $base_url = home_url('/'.self::CONSOLE_SLUG.'/');
         $staff_list = get_users(['role'=>self::ROLE,'orderby'=>'display_name','order'=>'ASC']);
         $task_notice = sanitize_key(wp_unslash($_GET['task_notice'] ?? ''));
+        $task_filters = [
+            'status'   => sanitize_key(wp_unslash($_GET['task_status'] ?? 'all')),
+            'priority' => sanitize_key(wp_unslash($_GET['task_priority'] ?? 'all')),
+            'team'     => sanitize_text_field(wp_unslash($_GET['task_team'] ?? '')),
+            'user_id'  => absint($_GET['task_user_id'] ?? 0),
+        ];
 
         ob_start(); ?>
         <style>
-        body{background:#f4f6f8!important}.soc-app{min-height:100vh;display:grid;grid-template-columns:250px 1fr;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827}.soc-sidebar{background:#111827;color:#fff;padding:26px 18px;position:sticky;top:0;height:100vh;box-sizing:border-box}.soc-brand{font-size:19px;font-weight:800;padding:0 10px 24px}.soc-brand small{display:block;color:#9ca3af;font-size:11px;font-weight:600;margin-top:4px}.soc-nav a{display:block;color:#cbd5e1;text-decoration:none;padding:11px 12px;border-radius:10px;margin:3px 0;font-size:14px}.soc-nav a:hover,.soc-nav a.active{background:#1f2937;color:#fff}.soc-sidebar-foot{position:absolute;left:18px;right:18px;bottom:22px;border-top:1px solid #374151;padding-top:16px}.soc-sidebar-foot strong,.soc-sidebar-foot span{display:block}.soc-sidebar-foot span{font-size:12px;color:#9ca3af;margin:3px 0 10px}.soc-sidebar-foot a{color:#cbd5e1;font-size:13px}.soc-main{padding:30px}.soc-top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:25px}.soc-top h1{font-size:29px;margin:0 0 4px}.soc-top p{margin:0;color:#6b7280}.soc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.soc-stat,.soc-panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px}.soc-stat{padding:20px}.soc-stat span{display:block;color:#6b7280;font-size:13px}.soc-stat strong{display:block;font-size:30px;margin-top:7px}.soc-columns{display:grid;grid-template-columns:1.25fr .9fr;gap:18px;margin-top:18px}.soc-panel{padding:21px}.soc-panel h2{font-size:17px;margin:0 0 16px}.soc-row{display:flex;justify-content:space-between;gap:14px;padding:13px 0;border-top:1px solid #f0f1f3}.soc-row:first-of-type{border-top:0}.soc-row-title{font-weight:700;font-size:14px}.soc-meta{font-size:12px;color:#6b7280;margin-top:4px}.soc-badge{height:max-content;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:750;background:#f3f4f6}.soc-empty{color:#6b7280;font-size:14px;padding:8px 0}.soc-task-grid{display:grid;grid-template-columns:340px 1fr;gap:18px}.soc-form label{display:block;font-size:12px;font-weight:700;margin:0 0 6px}.soc-form input,.soc-form select,.soc-form textarea{width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:10px;margin:0 0 13px;background:#fff}.soc-form textarea{min-height:90px;resize:vertical}.soc-btn{border:0;border-radius:10px;background:#111827;color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}.soc-btn-light{background:#eef0f3;color:#111827}.soc-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.soc-task{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-task-head{display:flex;justify-content:space-between;gap:12px}.soc-task h3{font-size:15px;margin:0}.soc-task p{font-size:13px;color:#4b5563}.soc-inline{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.soc-inline select,.soc-inline input{margin:0}.soc-alert{padding:12px 14px;border-radius:10px;background:#ecfdf5;color:#065f46;margin-bottom:16px}.soc-comments{margin-top:13px;padding-top:12px;border-top:1px solid #eef0f2}.soc-comment{font-size:12px;padding:7px 0}.soc-comment b{display:block}.soc-overdue{color:#b91c1c;font-weight:700}@media(max-width:900px){.soc-app{grid-template-columns:1fr}.soc-sidebar{height:auto;position:relative}.soc-sidebar-foot{position:static;margin-top:20px}.soc-main{padding:20px}.soc-grid{grid-template-columns:repeat(2,1fr)}.soc-columns,.soc-task-grid{grid-template-columns:1fr}}@media(max-width:520px){.soc-grid{grid-template-columns:1fr}}
+        body{background:#f4f6f8!important}.soc-app{min-height:100vh;display:grid;grid-template-columns:250px 1fr;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827}.soc-sidebar{background:#111827;color:#fff;padding:26px 18px;position:sticky;top:0;height:100vh;box-sizing:border-box}.soc-brand{font-size:19px;font-weight:800;padding:0 10px 24px}.soc-brand small{display:block;color:#9ca3af;font-size:11px;font-weight:600;margin-top:4px}.soc-nav a{display:block;color:#cbd5e1;text-decoration:none;padding:11px 12px;border-radius:10px;margin:3px 0;font-size:14px}.soc-nav a:hover,.soc-nav a.active{background:#1f2937;color:#fff}.soc-sidebar-foot{position:absolute;left:18px;right:18px;bottom:22px;border-top:1px solid #374151;padding-top:16px}.soc-sidebar-foot strong,.soc-sidebar-foot span{display:block}.soc-sidebar-foot span{font-size:12px;color:#9ca3af;margin:3px 0 10px}.soc-sidebar-foot a{color:#cbd5e1;font-size:13px}.soc-main{padding:30px}.soc-top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:25px}.soc-top h1{font-size:29px;margin:0 0 4px}.soc-top p{margin:0;color:#6b7280}.soc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.soc-stat,.soc-panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px}.soc-stat{padding:20px}.soc-stat span{display:block;color:#6b7280;font-size:13px}.soc-stat strong{display:block;font-size:30px;margin-top:7px}.soc-columns{display:grid;grid-template-columns:1.25fr .9fr;gap:18px;margin-top:18px}.soc-panel{padding:21px}.soc-panel h2{font-size:17px;margin:0 0 16px}.soc-row{display:flex;justify-content:space-between;gap:14px;padding:13px 0;border-top:1px solid #f0f1f3}.soc-row:first-of-type{border-top:0}.soc-row-title{font-weight:700;font-size:14px}.soc-meta{font-size:12px;color:#6b7280;margin-top:4px}.soc-badge{height:max-content;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:750;background:#f3f4f6}.soc-empty{color:#6b7280;font-size:14px;padding:8px 0}.soc-task-grid{display:grid;grid-template-columns:340px 1fr;gap:18px}.soc-form label{display:block;font-size:12px;font-weight:700;margin:0 0 6px}.soc-form input,.soc-form select,.soc-form textarea{width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:10px;margin:0 0 13px;background:#fff}.soc-form textarea{min-height:90px;resize:vertical}.soc-btn{border:0;border-radius:10px;background:#111827;color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}.soc-btn-light{background:#eef0f3;color:#111827}.soc-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.soc-task{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-task-head{display:flex;justify-content:space-between;gap:12px}.soc-task h3{font-size:15px;margin:0}.soc-task p{font-size:13px;color:#4b5563}.soc-inline{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.soc-inline select,.soc-inline input{margin:0}.soc-alert{padding:12px 14px;border-radius:10px;background:#ecfdf5;color:#065f46;margin-bottom:16px}.soc-comments{margin-top:13px;padding-top:12px;border-top:1px solid #eef0f2}.soc-comment{font-size:12px;padding:7px 0}.soc-comment b{display:block}.soc-overdue{color:#b91c1c;font-weight:700}.soc-filters{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:14px;padding:12px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px}.soc-filters label{font-size:12px;font-weight:700}.soc-filters select{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}@media(max-width:900px){.soc-app{grid-template-columns:1fr}.soc-sidebar{height:auto;position:relative}.soc-sidebar-foot{position:static;margin-top:20px}.soc-main{padding:20px}.soc-grid{grid-template-columns:repeat(2,1fr)}.soc-columns,.soc-task-grid{grid-template-columns:1fr}}@media(max-width:520px){.soc-grid{grid-template-columns:1fr}}
         </style>
         <div class="soc-app"><aside class="soc-sidebar"><div class="soc-brand">Surface Operations<small>Operating the Surface Internet</small></div><nav class="soc-nav">
         <?php $nav=['dashboard'=>'Dashboard','tasks'=>'Tasks','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth™','advocates'=>'Advocates','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','support'=>'Support','reports'=>'Reports','teams'=>'Teams','staff'=>'Staff','audit'=>'Audit']; foreach($nav as $key=>$label){if(!self::can_access($key,$user->ID))continue;$url=add_query_arg('soc_section',$key,$base_url);echo '<a class="'.($key===$section?'active':'').'" href="'.esc_url($url).'">'.esc_html($label).'</a>';} ?>
@@ -890,7 +982,7 @@ final class Surface_Operations_Console {
             <section class="soc-grid" style="margin-bottom:18px"><div class="soc-stat"><span>My Open Tasks</span><strong><?php echo esc_html($task_counts['mine']); ?></strong></div><div class="soc-stat"><span>Team Queue</span><strong><?php echo esc_html($task_counts['team']); ?></strong></div><div class="soc-stat"><span>Due Today</span><strong><?php echo esc_html($task_counts['due_today']); ?></strong></div><div class="soc-stat"><span>Overdue</span><strong><?php echo esc_html($task_counts['overdue']); ?></strong></div></section>
             <section class="soc-task-grid">
                 <?php if(self::can_manage_tasks($user->ID)): ?><div class="soc-panel"><h2>Assign Task</h2><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="create"><label>Task</label><input name="task_title" required><label>Description</label><textarea name="task_description"></textarea><label>Module</label><select name="task_module"><?php foreach(['general'=>'General','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth','advocacy'=>'Advocacy','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','support'=>'Support'] as $k=>$v)echo '<option value="'.esc_attr($k).'">'.esc_html($v).'</option>'; ?></select><label>Priority</label><select name="task_priority"><option value="low">Low</option><option value="normal" selected>Normal</option><option value="high">High</option><option value="urgent">Urgent</option></select><label>Assign to staff</label><select name="task_user_id"><option value="0">Team queue</option><?php foreach($staff_list as $member){if(self::staff_status($member->ID)==='suspended')continue;echo '<option value="'.esc_attr($member->ID).'">'.esc_html($member->display_name.' · '.self::user_team($member->ID)).'</option>';} ?></select><label>Team</label><select name="task_team"><option value="">Select team</option><?php foreach(self::teams() as $t)echo '<option value="'.esc_attr($t).'">'.esc_html($t).'</option>'; ?></select><label>Due date</label><input type="datetime-local" name="task_due_at"><button class="soc-btn" type="submit">Assign Task</button></form></div><?php endif; ?>
-                <div class="soc-panel"><h2><?php echo self::can_manage_tasks($user->ID)?'Operational Tasks':'My Tasks'; ?></h2><?php $tasks=self::visible_tasks($user->ID,$team,self::can_manage_tasks($user->ID)); if(!$tasks): ?><div class="soc-empty">No tasks found.</div><?php endif; ?><?php foreach($tasks as $task): $comments=self::task_comments($task->id); ?><article class="soc-task"><div class="soc-task-head"><div><h3><?php echo esc_html($task->title); ?></h3><div class="soc-meta"><?php echo esc_html(ucfirst($task->module).' · '.ucwords(str_replace('_',' ',$task->status)).' · '.ucfirst($task->priority)); ?><?php if($task->due_at): ?> · <span class="<?php echo ($task->status!=='completed' && strtotime($task->due_at)<current_time('timestamp'))?'soc-overdue':''; ?>">Due <?php echo esc_html(mysql2date('M j, g:i a',$task->due_at)); ?></span><?php endif; ?></div></div><span class="soc-badge"><?php echo esc_html($task->assigned_user_id?self::staff_name($task->assigned_user_id):($task->assigned_team?:'Unassigned')); ?></span></div><?php if($task->description): ?><p><?php echo nl2br(esc_html($task->description)); ?></p><?php endif; ?><div class="soc-actions"><?php if(!$task->assigned_user_id && $task->assigned_team===$team): ?><form method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="claim"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><button class="soc-btn" type="submit">Claim</button></form><?php endif; ?><form class="soc-inline" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="status"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><select name="task_status"><option value="open" <?php selected($task->status,'open'); ?>>Open</option><option value="in_progress" <?php selected($task->status,'in_progress'); ?>>In Progress</option><option value="completed" <?php selected($task->status,'completed'); ?>>Completed</option></select><button class="soc-btn soc-btn-light" type="submit">Update</button></form></div><div class="soc-comments"><?php foreach($comments as $comment): ?><div class="soc-comment"><b><?php echo esc_html(self::staff_name($comment->user_id)); ?></b><?php echo esc_html($comment->comment_text); ?> <span class="soc-meta"><?php echo esc_html(mysql2date('M j, g:i a',$comment->created_at)); ?></span></div><?php endforeach; ?><form class="soc-inline" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="comment"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><input type="text" name="task_comment" placeholder="Add internal comment" required><button class="soc-btn soc-btn-light" type="submit">Comment</button></form></div></article><?php endforeach; ?></div>
+                <div class="soc-panel"><h2><?php echo self::can_manage_tasks($user->ID)?'Operational Tasks':'My Tasks'; ?></h2><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="tasks"><label>Status<select name="task_status"><option value="all">All</option><option value="open" <?php selected($task_filters['status'],'open'); ?>>Open</option><option value="in_progress" <?php selected($task_filters['status'],'in_progress'); ?>>In Progress</option><option value="completed" <?php selected($task_filters['status'],'completed'); ?>>Completed</option></select></label><label>Priority<select name="task_priority"><option value="all">All</option><?php foreach(['low'=>'Low','normal'=>'Normal','high'=>'High','urgent'=>'Urgent'] as $k=>$v)echo '<option value="'.esc_attr($k).'" '.selected($task_filters['priority'],$k,false).'>'.esc_html($v).'</option>'; ?></select></label><?php if(self::can_manage_tasks($user->ID)): ?><label>Team<select name="task_team"><option value="">All teams</option><?php foreach(self::teams() as $t)echo '<option value="'.esc_attr($t).'" '.selected($task_filters['team'],$t,false).'>'.esc_html($t).'</option>'; ?></select></label><label>Staff<select name="task_user_id"><option value="0">All staff</option><?php foreach($staff_list as $member)echo '<option value="'.esc_attr($member->ID).'" '.selected($task_filters['user_id'],$member->ID,false).'>'.esc_html($member->display_name).'</option>'; ?></select></label><?php endif; ?><button class="soc-btn soc-btn-light" type="submit">Filter</button><a class="soc-btn soc-btn-light" style="text-decoration:none" href="<?php echo esc_url(add_query_arg('soc_section','tasks',$base_url)); ?>">Reset</a></form><?php $tasks=self::visible_tasks($user->ID,$team,self::can_manage_tasks($user->ID),$task_filters); if(!$tasks): ?><div class="soc-empty">No tasks found.</div><?php endif; ?><?php foreach($tasks as $task): $comments=self::task_comments($task->id); ?><article class="soc-task"><div class="soc-task-head"><div><h3><?php echo esc_html($task->title); ?></h3><div class="soc-meta"><?php echo esc_html(ucfirst($task->module).' · '.ucwords(str_replace('_',' ',$task->status)).' · '.ucfirst($task->priority)); ?><?php if($task->due_at): ?> · <span class="<?php echo ($task->status!=='completed' && strtotime($task->due_at)<current_time('timestamp'))?'soc-overdue':''; ?>">Due <?php echo esc_html(mysql2date('M j, g:i a',$task->due_at)); ?></span><?php endif; ?></div></div><span class="soc-badge"><?php echo esc_html($task->assigned_user_id?self::staff_name($task->assigned_user_id):($task->assigned_team?:'Unassigned')); ?></span></div><?php if($task->description): ?><p><?php echo nl2br(esc_html($task->description)); ?></p><?php endif; ?><div class="soc-actions"><?php if(self::can_manage_tasks($user->ID)): ?><form class="soc-inline" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="reassign"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><select name="task_user_id"><option value="0">Team queue</option><?php foreach($staff_list as $member){if(self::staff_status($member->ID)==='suspended')continue;echo '<option value="'.esc_attr($member->ID).'" '.selected((int)$task->assigned_user_id,$member->ID,false).'>'.esc_html($member->display_name).'</option>';} ?></select><select name="task_team"><option value="">No team</option><?php foreach(self::teams() as $t)echo '<option value="'.esc_attr($t).'" '.selected((string)$task->assigned_team,$t,false).'>'.esc_html($t).'</option>'; ?></select><button class="soc-btn soc-btn-light" type="submit">Reassign</button></form><?php endif; ?><?php if(!$task->assigned_user_id && $task->assigned_team===$team): ?><form method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="claim"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><button class="soc-btn" type="submit">Claim</button></form><?php endif; ?><form class="soc-inline" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="status"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><select name="task_status"><option value="open" <?php selected($task->status,'open'); ?>>Open</option><option value="in_progress" <?php selected($task->status,'in_progress'); ?>>In Progress</option><option value="completed" <?php selected($task->status,'completed'); ?>>Completed</option></select><button class="soc-btn soc-btn-light" type="submit">Update</button></form></div><div class="soc-comments"><?php foreach($comments as $comment): ?><div class="soc-comment"><b><?php echo esc_html(self::staff_name($comment->user_id)); ?></b><?php echo esc_html($comment->comment_text); ?> <span class="soc-meta"><?php echo esc_html(mysql2date('M j, g:i a',$comment->created_at)); ?></span></div><?php endforeach; ?><form class="soc-inline" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="comment"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><input type="text" name="task_comment" placeholder="Add internal comment" required><button class="soc-btn soc-btn-light" type="submit">Comment</button></form></div></article><?php endforeach; ?></div>
             </section>
         <?php else: ?>
             <div class="soc-top"><div><h1><?php echo esc_html(self::greeting().', '.self::first_name($user->display_name)); ?></h1><p>Here is what needs attention across your operations.</p></div></div><section class="soc-grid"><div class="soc-stat"><span>My Open Tasks</span><strong><?php echo esc_html($task_counts['mine']); ?></strong></div><div class="soc-stat"><span>Team Queue</span><strong><?php echo esc_html($task_counts['team']); ?></strong></div><div class="soc-stat"><span>Due Today</span><strong><?php echo esc_html($task_counts['due_today']); ?></strong></div><div class="soc-stat"><span>Overdue</span><strong><?php echo esc_html($task_counts['overdue']); ?></strong></div></section><section class="soc-columns"><div class="soc-panel"><h2>My To-do List</h2><?php if(!$recent_tasks): ?><div class="soc-empty">No tasks have been assigned yet.</div><?php endif; ?><?php foreach($recent_tasks as $task): ?><div class="soc-row"><div><div class="soc-row-title"><?php echo esc_html($task->title); ?></div><div class="soc-meta"><?php echo esc_html(ucfirst($task->module).($task->due_at?' · Due '.mysql2date('M j, g:i a',$task->due_at):'')); ?></div></div><span class="soc-badge"><?php echo esc_html(ucfirst($task->priority)); ?></span></div><?php endforeach; ?></div><div class="soc-panel"><h2>Recent Operations Activity</h2><?php if(!$recent_audit): ?><div class="soc-empty">Activity will appear here as operations begin.</div><?php endif; ?><?php foreach($recent_audit as $entry): ?><div class="soc-row"><div><div class="soc-row-title"><?php echo esc_html($entry->summary); ?></div><div class="soc-meta"><?php echo esc_html(mysql2date('M j, g:i a',$entry->created_at)); ?></div></div></div><?php endforeach; ?></div></section>
@@ -906,10 +998,44 @@ final class Surface_Operations_Console {
         return (int)$task->assigned_user_id === (int)$user_id || (empty($task->assigned_user_id) && (string)$task->assigned_team === (string)$team);
     }
 
-    private static function visible_tasks($user_id, $team, $all=false) {
-        global $wpdb; $table=$wpdb->prefix.'surface_operations_tasks';
-        if ($all) return $wpdb->get_results("SELECT * FROM {$table} ORDER BY CASE status WHEN 'open' THEN 1 WHEN 'in_progress' THEN 2 ELSE 3 END, CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END, due_at IS NULL, due_at ASC, id DESC LIMIT 100");
-        return $wpdb->get_results($wpdb->prepare("SELECT * FROM {$table} WHERE assigned_user_id=%d OR (assigned_team=%s AND (assigned_user_id IS NULL OR assigned_user_id=0)) ORDER BY CASE status WHEN 'open' THEN 1 WHEN 'in_progress' THEN 2 ELSE 3 END, CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END, due_at IS NULL, due_at ASC, id DESC LIMIT 100",$user_id,$team));
+    private static function visible_tasks($user_id, $team, $all=false, $filters=[]) {
+        global $wpdb;
+        $table=$wpdb->prefix.'surface_operations_tasks';
+        $conditions=[];
+        $args=[];
+
+        if (!$all) {
+            $conditions[]='(assigned_user_id=%d OR (assigned_team=%s AND (assigned_user_id IS NULL OR assigned_user_id=0)))';
+            $args[]=$user_id;
+            $args[]=$team;
+        }
+
+        $status=sanitize_key($filters['status'] ?? 'all');
+        $priority=sanitize_key($filters['priority'] ?? 'all');
+        $filter_team=sanitize_text_field($filters['team'] ?? '');
+        $filter_user=absint($filters['user_id'] ?? 0);
+
+        if (in_array($status,['open','in_progress','completed'],true)) {
+            $conditions[]='status=%s';
+            $args[]=$status;
+        }
+        if (in_array($priority,['low','normal','high','urgent'],true)) {
+            $conditions[]='priority=%s';
+            $args[]=$priority;
+        }
+        if ($all && $filter_team!=='') {
+            $conditions[]='assigned_team=%s';
+            $args[]=$filter_team;
+        }
+        if ($all && $filter_user) {
+            $conditions[]='assigned_user_id=%d';
+            $args[]=$filter_user;
+        }
+
+        $where=$conditions?' WHERE '.implode(' AND ',$conditions):'';
+        $sql="SELECT * FROM {$table}{$where} ORDER BY CASE status WHEN 'open' THEN 1 WHEN 'in_progress' THEN 2 ELSE 3 END, CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END, due_at IS NULL, due_at ASC, id DESC LIMIT 100";
+        if ($args) $sql=$wpdb->prepare($sql,$args);
+        return $wpdb->get_results($sql);
     }
 
     private static function task_comments($task_id) {
