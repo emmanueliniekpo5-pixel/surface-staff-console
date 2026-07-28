@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.4.0
+ * Version: 1.4.1
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.4.0';
+    const VERSION = '1.4.1';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -30,6 +30,7 @@ final class Surface_Operations_Console {
         add_action('template_redirect', [__CLASS__, 'handle_surfacetooth_actions'], 7);
         add_action('template_redirect', [__CLASS__, 'handle_campaign_actions'], 8);
         add_action('template_redirect', [__CLASS__, 'handle_wallet_actions'], 9);
+        add_action('template_redirect', [__CLASS__, 'handle_bundle_actions'], 10);
         add_action('template_redirect', [__CLASS__, 'guard_staff_frontend'], 20);
 
         add_shortcode('surface_staff_login', [__CLASS__, 'render_login']);
@@ -1464,6 +1465,113 @@ final class Surface_Operations_Console {
         exit;
     }
 
+
+    private static function bundle_table() {
+        global $wpdb;
+        return $wpdb->prefix . 'surface_bundles';
+    }
+
+    private static function bundles($search = '') {
+        global $wpdb;
+        $table = self::bundle_table();
+        if (!self::table_exists($table)) return [];
+        $sql = "SELECT * FROM {$table}";
+        $args = [];
+        if ($search !== '') {
+            $like = '%' . $wpdb->esc_like($search) . '%';
+            $user_ids = get_users([
+                'search' => '*' . $search . '*',
+                'search_columns' => ['user_login','user_email','display_name'],
+                'fields' => 'ID',
+            ]);
+            $sii_ids = get_users([
+                'meta_query' => [['key'=>'surface_sii','value'=>$search,'compare'=>'LIKE']],
+                'fields' => 'ID',
+            ]);
+            $ids = array_values(array_unique(array_map('absint', array_merge((array)$user_ids,(array)$sii_ids))));
+            $where = ['bundle_code LIKE %s'];
+            $args[] = $like;
+            if ($ids) $where[] = 'user_id IN (' . implode(',', $ids) . ')';
+            $sql .= ' WHERE (' . implode(' OR ', $where) . ')';
+        }
+        $sql .= ' ORDER BY purchased_at DESC, id DESC LIMIT 500';
+        return $args ? $wpdb->get_results($wpdb->prepare($sql, $args)) : $wpdb->get_results($sql);
+    }
+
+    private static function bundle_status($bundle) {
+        $status = sanitize_key((string)($bundle->status ?? 'active'));
+        if ($status === 'suspended') return 'suspended';
+        if (!empty($bundle->expires_at) && strtotime($bundle->expires_at) < current_time('timestamp')) return 'expired';
+        if ((float)($bundle->remaining_mb ?? 0) <= 0) return 'consumed';
+        return $status ?: 'active';
+    }
+
+    private static function bundle_summary() {
+        global $wpdb;
+        $table = self::bundle_table();
+        $summary = ['total'=>0,'active'=>0,'expired'=>0,'used'=>0,'remaining'=>0];
+        if (!self::table_exists($table)) return $summary;
+        $rows = $wpdb->get_results("SELECT * FROM {$table}");
+        foreach ($rows as $row) {
+            $summary['total']++;
+            $status = self::bundle_status($row);
+            if ($status === 'active') $summary['active']++;
+            if ($status === 'expired') $summary['expired']++;
+            $summary['used'] += (float)($row->used_mb ?? 0);
+            $summary['remaining'] += max(0,(float)($row->remaining_mb ?? 0));
+        }
+        return $summary;
+    }
+
+    private static function format_storage($mb) {
+        $mb=(float)$mb;
+        if ($mb >= 1024) return number_format($mb/1024,2).' GB';
+        return number_format($mb,2).' MB';
+    }
+
+    private static function bundle_partner($bundle) {
+        $user = !empty($bundle->user_id) ? get_user_by('id', absint($bundle->user_id)) : false;
+        return $user ?: false;
+    }
+
+    private static function bundle_audit_history($bundle_id, $limit=20) {
+        global $wpdb;
+        $table=$wpdb->prefix.'surface_operations_audit';
+        if (!self::table_exists($table)) return [];
+        return $wpdb->get_results($wpdb->prepare("SELECT * FROM {$table} WHERE object_type='bundle' AND object_id=%s ORDER BY created_at DESC LIMIT %d",(string)$bundle_id,$limit));
+    }
+
+    public static function handle_bundle_actions() {
+        if (empty($_POST['surface_operations_bundle_action'])) return;
+        if (!is_user_logged_in() || !self::is_staff()) return;
+        $user=wp_get_current_user();
+        if (!self::can_access('bundles',$user->ID)) return;
+        check_admin_referer('surface_operations_bundle','surface_operations_bundle_nonce');
+        global $wpdb;
+        $table=self::bundle_table();
+        if (!self::table_exists($table)) return;
+        $bundle_id=absint($_POST['bundle_id'] ?? 0);
+        $bundle=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d",$bundle_id));
+        if (!$bundle) return;
+        $action=sanitize_key(wp_unslash($_POST['surface_operations_bundle_action']));
+        $notice='';
+        if ($action==='suspend' || $action==='reactivate') {
+            $new_status=$action==='suspend'?'suspended':'active';
+            $wpdb->update($table,['status'=>$new_status],['id'=>$bundle_id],['%s'],['%d']);
+            self::audit('bundle_'.$action,'bundle',(string)$bundle_id,ucfirst($action).'d bundle: '.($bundle->bundle_code ?: '#'.$bundle_id),['bundle_id'=>$bundle_id,'bundle_code'=>$bundle->bundle_code,'status'=>$new_status]);
+            $notice=$action;
+        } elseif ($action==='extend') {
+            $days=max(1,min(3650,absint($_POST['extension_days'] ?? 0)));
+            $base=!empty($bundle->expires_at) && strtotime($bundle->expires_at)>current_time('timestamp') ? strtotime($bundle->expires_at) : current_time('timestamp');
+            $new_expiry=wp_date('Y-m-d H:i:s',strtotime('+'.$days.' days',$base));
+            $wpdb->update($table,['expires_at'=>$new_expiry,'status'=>'active'],['id'=>$bundle_id],['%s','%s'],['%d']);
+            self::audit('bundle_expiry_extended','bundle',(string)$bundle_id,'Extended bundle expiry: '.($bundle->bundle_code ?: '#'.$bundle_id),['bundle_id'=>$bundle_id,'bundle_code'=>$bundle->bundle_code,'days'=>$days,'old_expiry'=>$bundle->expires_at,'new_expiry'=>$new_expiry]);
+            $notice='extended';
+        }
+        wp_safe_redirect(add_query_arg(['soc_section'=>'bundles','bundle_notice'=>$notice,'view_bundle'=>$bundle_id],home_url('/'.self::CONSOLE_SLUG.'/')));
+        exit;
+    }
+
     public static function render_console() {
         if (!is_user_logged_in() || !self::is_staff()) {
             return '<script>window.location.href=' . wp_json_encode(home_url('/' . self::LOGIN_SLUG . '/')) . ';</script>';
@@ -1521,6 +1629,24 @@ final class Surface_Operations_Console {
             global $wpdb;
             $campaign_table = $wpdb->prefix . 'surface_campaigns';
             if (self::table_exists($campaign_table)) $view_campaign = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$campaign_table} WHERE id=%d", $view_campaign_id));
+        }
+        $bundle_search = sanitize_text_field(wp_unslash($_GET['bundle_search'] ?? ''));
+        $bundles = $section === 'bundles' ? self::bundles($bundle_search) : [];
+        $bundle_totals = $section === 'bundles' ? self::bundle_summary() : ['total'=>0,'active'=>0,'expired'=>0,'used'=>0,'remaining'=>0];
+        $bundle_notice = sanitize_key(wp_unslash($_GET['bundle_notice'] ?? ''));
+        $view_bundle_id = absint($_GET['view_bundle'] ?? 0);
+        $view_bundle = false;
+        $bundle_history = [];
+        if ($view_bundle_id) {
+            global $wpdb;
+            $bundle_table = self::bundle_table();
+            if (self::table_exists($bundle_table)) {
+                $view_bundle = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$bundle_table} WHERE id=%d", $view_bundle_id));
+                if ($view_bundle && $section === 'bundles') {
+                    self::audit('bundle_viewed','bundle',(string)$view_bundle_id,'Viewed bundle: '.($view_bundle->bundle_code ?: '#'.$view_bundle_id),['bundle_id'=>$view_bundle_id,'bundle_code'=>$view_bundle->bundle_code]);
+                    $bundle_history = self::bundle_audit_history($view_bundle_id);
+                }
+            }
         }
         $wallet_search = sanitize_text_field(wp_unslash($_GET['wallet_search'] ?? ''));
         $wallet_transactions = $section === 'wallet' ? self::wallet_transactions($wallet_search) : [];
@@ -1618,6 +1744,15 @@ final class Surface_Operations_Console {
                 <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">Campaign Details</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Back to Campaigns</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Campaign Name</span><strong><?php echo esc_html($view_campaign->campaign_name); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vc_partner); ?></strong></div><div class="soc-profile-field"><span>SurfaceTooth</span><strong><?php echo esc_html($vc_tooth ? $vc_tooth->post_title : 'Receipt SurfaceTooth'); ?></strong></div><div class="soc-profile-field"><span>Campaign Type</span><strong><?php echo esc_html(ucfirst((string)($view_campaign->campaign_scope ?? 'partner')).' Receipt Campaign'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst(self::campaign_status($view_campaign))); ?></strong></div><div class="soc-profile-field"><span>Start Date</span><strong><?php echo esc_html(!empty($view_campaign->preferred_start_date) ? mysql2date('M j, Y',$view_campaign->preferred_start_date) : 'Immediate'); ?></strong></div><div class="soc-profile-field"><span>End Date</span><strong><?php echo esc_html(!empty($view_campaign->end_date) ? $view_campaign->end_date : 'Not specified'); ?></strong></div><div class="soc-profile-field"><span>Target</span><strong><?php echo esc_html((string)($view_campaign->target_value ?? 'Not specified')); ?></strong></div><div class="soc-profile-field"><span>Expected Winners</span><strong><?php echo esc_html(absint($view_campaign->expected_winners ?? 0)); ?></strong></div><div class="soc-profile-field"><span>Current Winners</span><strong><?php echo esc_html($vc_counts['winners']); ?></strong></div><div class="soc-profile-field"><span>Participation Count</span><strong><?php echo esc_html($vc_counts['participation']); ?></strong></div><div class="soc-profile-field"><span>Progress</span><strong><?php echo esc_html(self::campaign_progress($view_campaign)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Cashback Configuration</span><strong><?php echo esc_html(self::campaign_cashback_summary($view_campaign->id)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Grand Cashback Configuration</span><strong><?php echo esc_html(self::campaign_grand_cashback($view_campaign)); ?></strong></div></div></section>
             <?php endif; ?>
             <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="campaigns"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="campaign_search" value="<?php echo esc_attr($campaign_search); ?>" placeholder="Search campaign, partner or SII"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Campaign</th><th>Partner</th><th>SurfaceTooth</th><th>Type</th><th>Start</th><th>End</th><th>Status</th><th>Progress</th><th>Actions</th></tr></thead><tbody><?php if(!$campaigns): ?><tr><td colspan="9" class="soc-empty">No campaigns found. Receipt campaigns will appear here when available.</td></tr><?php endif; ?><?php foreach($campaigns as $campaign): $cs=self::campaign_status($campaign);$ct=self::campaign_surfacetooth($campaign); ?><tr><td><strong><?php echo esc_html($campaign->campaign_name); ?></strong></td><td><?php echo esc_html(self::campaign_partner_name($campaign->partner_id ?? 0)); ?></td><td><?php echo esc_html($ct?$ct->post_title:'Receipt SurfaceTooth'); ?></td><td><?php echo esc_html(ucfirst((string)($campaign->campaign_scope ?? 'partner'))); ?></td><td><?php echo esc_html(!empty($campaign->preferred_start_date)?mysql2date('M j, Y',$campaign->preferred_start_date):'Immediate'); ?></td><td><?php echo esc_html(!empty($campaign->end_date)?$campaign->end_date:'—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($cs)); ?></span></td><td><?php echo esc_html(self::campaign_progress($campaign)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'campaigns','view_campaign'=>$campaign->id],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_campaign','surface_operations_campaign_nonce'); ?><input type="hidden" name="campaign_id" value="<?php echo esc_attr($campaign->id); ?>"><input type="hidden" name="surface_operations_campaign_action" value="<?php echo esc_attr($cs==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $cs==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($cs==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+        <?php elseif($section==='bundles'): ?>
+            <div class="soc-top"><div><h1>Bundle Operations Centre</h1><p>Monitor partner bandwidth bundles, storage usage and expiry.</p></div></div>
+            <?php if($bundle_notice): ?><div class="soc-alert"><?php echo esc_html($bundle_notice==='extended'?'Bundle expiry extended.':($bundle_notice==='suspend'?'Bundle suspended.':'Bundle reactivated.')); ?></div><?php endif; ?>
+            <section class="soc-grid" style="grid-template-columns:repeat(5,minmax(0,1fr));margin-bottom:18px"><div class="soc-stat"><span>Total Bundles</span><strong><?php echo esc_html($bundle_totals['total']); ?></strong></div><div class="soc-stat"><span>Active Bundles</span><strong><?php echo esc_html($bundle_totals['active']); ?></strong></div><div class="soc-stat"><span>Expired Bundles</span><strong><?php echo esc_html($bundle_totals['expired']); ?></strong></div><div class="soc-stat"><span>Consumed Storage</span><strong><?php echo esc_html(self::format_storage($bundle_totals['used'])); ?></strong></div><div class="soc-stat"><span>Remaining Storage</span><strong><?php echo esc_html(self::format_storage($bundle_totals['remaining'])); ?></strong></div></section>
+            <?php if($view_bundle): $vb_partner=self::bundle_partner($view_bundle);$vb_status=self::bundle_status($view_bundle); ?>
+            <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">Bundle Details</h2><p>Operational view and controlled status actions.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','bundles',$base_url)); ?>">Back to Bundles</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Bundle Code</span><strong><?php echo esc_html($view_bundle->bundle_code ?: 'Bundle #'.$view_bundle->id); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vb_partner?$vb_partner->display_name:'Unknown partner'); ?></strong></div><div class="soc-profile-field"><span>SII</span><strong><?php echo esc_html($vb_partner?(self::partner_sii($vb_partner->ID) ?: 'Not assigned'):'Not linked'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst($vb_status)); ?></strong></div><div class="soc-profile-field"><span>Original Capacity</span><strong><?php echo esc_html(self::format_storage($view_bundle->capacity_mb ?? 0)); ?></strong></div><div class="soc-profile-field"><span>Used Storage</span><strong><?php echo esc_html(self::format_storage($view_bundle->used_mb ?? 0)); ?></strong></div><div class="soc-profile-field"><span>Remaining Storage</span><strong><?php echo esc_html(self::format_storage($view_bundle->remaining_mb ?? 0)); ?></strong></div><div class="soc-profile-field"><span>Purchase Date</span><strong><?php echo esc_html(!empty($view_bundle->purchased_at)?mysql2date('M j, Y g:i a',$view_bundle->purchased_at):'Not recorded'); ?></strong></div><div class="soc-profile-field"><span>Expiry Date</span><strong><?php echo esc_html(!empty($view_bundle->expires_at)?mysql2date('M j, Y g:i a',$view_bundle->expires_at):'No expiry recorded'); ?></strong></div><div class="soc-profile-field"><span>Price</span><strong>₦<?php echo esc_html(number_format((float)($view_bundle->price ?? 0),2)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>SurfaceTeeth Using Bundle</span><strong>Usage is reflected in the consumed storage total. Per-SurfaceTooth allocation is not stored in the current bundle table.</strong></div></div><div class="soc-actions" style="margin-top:16px"><form method="post" class="soc-inline"><?php wp_nonce_field('surface_operations_bundle','surface_operations_bundle_nonce'); ?><input type="hidden" name="bundle_id" value="<?php echo esc_attr($view_bundle->id); ?>"><input type="hidden" name="surface_operations_bundle_action" value="extend"><label style="font-size:12px;font-weight:700">Extend by days<input type="number" min="1" max="3650" name="extension_days" value="30" style="width:110px;padding:9px;border:1px solid #d1d5db;border-radius:8px;display:block;margin-top:5px"></label><button class="soc-btn" type="submit">Extend Expiry</button></form><form method="post"><?php wp_nonce_field('surface_operations_bundle','surface_operations_bundle_nonce'); ?><input type="hidden" name="bundle_id" value="<?php echo esc_attr($view_bundle->id); ?>"><input type="hidden" name="surface_operations_bundle_action" value="<?php echo esc_attr($vb_status==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn soc-btn-light" type="submit"><?php echo esc_html($vb_status==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></section>
+            <section class="soc-panel" style="margin-bottom:18px"><h2>Usage & Audit History</h2><?php if(!$bundle_history): ?><div class="soc-empty">No bundle activity recorded yet.</div><?php endif; ?><?php foreach($bundle_history as $entry): ?><div class="soc-row"><div><div class="soc-row-title"><?php echo esc_html($entry->summary); ?></div><div class="soc-meta"><?php echo esc_html(mysql2date('M j, Y g:i a',$entry->created_at)); ?></div></div><span class="soc-badge"><?php echo esc_html(ucwords(str_replace('_',' ',$entry->action_key))); ?></span></div><?php endforeach; ?></section>
+            <?php endif; ?>
+            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="bundles"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="bundle_search" value="<?php echo esc_attr($bundle_search); ?>" placeholder="Search bundle code, partner or SII"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','bundles',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Bundle Code</th><th>Partner</th><th>Capacity</th><th>Used</th><th>Remaining</th><th>Status</th><th>Expiry Date</th><th>Actions</th></tr></thead><tbody><?php if(!$bundles): ?><tr><td colspan="8" class="soc-empty">No bundles found. Bundles will appear when the Surface Bundles table is available.</td></tr><?php endif; ?><?php foreach($bundles as $bundle): $b_partner=self::bundle_partner($bundle);$b_status=self::bundle_status($bundle); ?><tr><td><strong><?php echo esc_html($bundle->bundle_code ?: 'Bundle #'.$bundle->id); ?></strong></td><td><?php echo esc_html($b_partner?$b_partner->display_name:'Unknown partner'); ?><?php if($b_partner && self::partner_sii($b_partner->ID)): ?><div class="soc-meta">/<?php echo esc_html(self::partner_sii($b_partner->ID)); ?></div><?php endif; ?></td><td><?php echo esc_html(self::format_storage($bundle->capacity_mb ?? 0)); ?></td><td><?php echo esc_html(self::format_storage($bundle->used_mb ?? 0)); ?></td><td><?php echo esc_html(self::format_storage($bundle->remaining_mb ?? 0)); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($b_status)); ?></span></td><td><?php echo esc_html(!empty($bundle->expires_at)?mysql2date('M j, Y',$bundle->expires_at):'—'); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'bundles','view_bundle'=>$bundle->id],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_bundle','surface_operations_bundle_nonce'); ?><input type="hidden" name="bundle_id" value="<?php echo esc_attr($bundle->id); ?>"><input type="hidden" name="surface_operations_bundle_action" value="<?php echo esc_attr($b_status==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $b_status==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($b_status==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
         <?php elseif($section==='wallet'): ?>
             <div class="soc-top"><div><h1>Wallet Operations Centre</h1><p>Monitor wallet balances and transaction activity without changing financial records.</p></div></div>
             <?php if($wallet_notice): ?><div class="soc-alert">Transaction marked as reviewed.</div><?php endif; ?>
