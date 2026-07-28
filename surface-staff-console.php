@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.3.9
+ * Version: 1.4.0
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.3.9';
+    const VERSION = '1.4.0';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -29,6 +29,7 @@ final class Surface_Operations_Console {
         add_action('template_redirect', [__CLASS__, 'handle_partner_actions'], 6);
         add_action('template_redirect', [__CLASS__, 'handle_surfacetooth_actions'], 7);
         add_action('template_redirect', [__CLASS__, 'handle_campaign_actions'], 8);
+        add_action('template_redirect', [__CLASS__, 'handle_wallet_actions'], 9);
         add_action('template_redirect', [__CLASS__, 'guard_staff_frontend'], 20);
 
         add_shortcode('surface_staff_login', [__CLASS__, 'render_login']);
@@ -97,6 +98,16 @@ final class Surface_Operations_Console {
             KEY actor_user_id (actor_user_id),
             KEY action_key (action_key),
             KEY object_type (object_type)
+        ) {$charset};");
+        $wallet_reviews = $wpdb->prefix . 'surface_operations_wallet_reviews';
+        dbDelta("CREATE TABLE {$wallet_reviews} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            ledger_id BIGINT UNSIGNED NOT NULL,
+            reviewed_by BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            reviewed_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY ledger_id (ledger_id),
+            KEY reviewed_by (reviewed_by)
         ) {$charset};");
         update_option('surface_operations_console_version', self::VERSION, false);
     }
@@ -1302,6 +1313,132 @@ final class Surface_Operations_Console {
         }));
     }
 
+    private static function wallet_owner($phone) {
+        $phone = trim((string)$phone);
+        if ($phone === '') return null;
+        $keys = ['surface_phone','billing_phone','phone'];
+        foreach ($keys as $key) {
+            $users = get_users(['meta_key'=>$key,'meta_value'=>$phone,'number'=>1,'fields'=>'all']);
+            if ($users) return $users[0];
+        }
+        return null;
+    }
+
+    private static function wallet_source_label($source) {
+        $source = sanitize_key((string)$source);
+        $labels = [
+            'receipt_reward'=>'Receipt Cashback',
+            'receipt_cashback'=>'Receipt Cashback',
+            'participation_reward'=>'Participation Cashback',
+            'participation_cashback'=>'Participation Cashback',
+            'duplicate_exchange'=>'Double Collectible Cashback',
+            'double_collectible_cashback'=>'Double Collectible Cashback',
+            'grand_reward'=>'Grand Cashback',
+            'grand_cashback'=>'Grand Cashback',
+            'advocate_introduction_credit'=>'Advocacy Introduction',
+            'advocate_bundle_credit'=>'Advocacy Bundle',
+            'advocate_receipt_commission_credit'=>'Advocacy Receipt Commission',
+            'bundle_purchase'=>'Bundle',
+            'manual'=>'Manual',
+        ];
+        return $labels[$source] ?? ucwords(str_replace('_',' ',$source ?: 'Wallet'));
+    }
+
+    private static function wallet_reviews() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'surface_operations_wallet_reviews';
+        if (!self::table_exists($table)) return [];
+        $ids = $wpdb->get_col("SELECT ledger_id FROM {$table}");
+        return array_fill_keys(array_map('intval',(array)$ids), true);
+    }
+
+    private static function wallet_transactions($search = '') {
+        global $wpdb;
+        $table = $wpdb->prefix . 'surface_kx_wallet_ledger';
+        if (!self::table_exists($table)) return [];
+        $rows = $wpdb->get_results("SELECT * FROM {$table} ORDER BY id DESC LIMIT 500");
+        $search = strtolower(trim((string)$search));
+        if ($search === '') return $rows;
+        return array_values(array_filter($rows, function($row) use ($search) {
+            $owner = self::wallet_owner($row->phone_number ?? '');
+            $name = $owner ? $owner->display_name.' '.$owner->user_email : '';
+            $sii = $owner ? self::partner_sii($owner->ID) : '';
+            $haystack = strtolower(($row->reference ?? '').' '.($row->phone_number ?? '').' '.($row->source ?? '').' '.$name.' '.$sii);
+            return strpos($haystack,$search) !== false;
+        }));
+    }
+
+    private static function wallet_summary() {
+        global $wpdb;
+        $wallets = $wpdb->prefix . 'surface_kx_wallets';
+        $ledger = $wpdb->prefix . 'surface_kx_wallet_ledger';
+        $summary = ['balance'=>0.0,'credits'=>0.0,'debits'=>0.0,'pending'=>0,'failed'=>0];
+        if (self::table_exists($wallets)) $summary['balance'] = (float)$wpdb->get_var("SELECT COALESCE(SUM(balance),0) FROM {$wallets}");
+        if (self::table_exists($ledger)) {
+            $summary['credits'] = (float)$wpdb->get_var("SELECT COALESCE(SUM(amount),0) FROM {$ledger} WHERE amount > 0");
+            $summary['debits'] = abs((float)$wpdb->get_var("SELECT COALESCE(SUM(amount),0) FROM {$ledger} WHERE amount < 0"));
+        }
+        return $summary;
+    }
+
+    private static function wallet_related_context($row) {
+        global $wpdb;
+        $result = ['campaign'=>'Not linked','surfacetooth'=>'Not linked'];
+        $receipts = $wpdb->prefix . 'surface_receipts';
+        if (!self::table_exists($receipts) || empty($row->reference)) return $result;
+        $columns = $wpdb->get_col("SHOW COLUMNS FROM {$receipts}",0);
+        $reference_columns = array_values(array_intersect(['receipt_id','reference','receipt_reference'],(array)$columns));
+        if (!$reference_columns) return $result;
+        $parts=[]; $args=[];
+        foreach($reference_columns as $column){$parts[]="{$column}=%s";$args[]=(string)$row->reference;}
+        $receipt=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$receipts} WHERE ".implode(' OR ',$parts)." LIMIT 1",...$args));
+        if (!$receipt) return $result;
+        if (!empty($receipt->campaign_id)) {
+            $campaigns=$wpdb->prefix.'surface_campaigns';
+            if(self::table_exists($campaigns)){
+                $campaign=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$campaigns} WHERE id=%d",absint($receipt->campaign_id)));
+                if($campaign){
+                    $result['campaign']=$campaign->campaign_name ?: 'Campaign #'.$campaign->id;
+                    $tooth=self::campaign_surfacetooth($campaign);
+                    if($tooth)$result['surfacetooth']=$tooth->post_title;
+                }
+            }
+        }
+        return $result;
+    }
+
+    public static function handle_wallet_actions() {
+        if (!is_user_logged_in() || !self::is_staff()) return;
+        if (empty($_POST['surface_operations_wallet_action'])) return;
+        $user = wp_get_current_user();
+        if (!self::can_access('wallet',$user->ID)) return;
+        check_admin_referer('surface_operations_wallet','surface_operations_wallet_nonce');
+        $action=sanitize_key(wp_unslash($_POST['surface_operations_wallet_action']));
+        $ledger_id=absint($_POST['ledger_id'] ?? 0);
+        if($action!=='review' || !$ledger_id)return;
+        global $wpdb;
+        $ledger=$wpdb->prefix.'surface_kx_wallet_ledger';
+        $reviews=$wpdb->prefix.'surface_operations_wallet_reviews';
+        if(!self::table_exists($ledger) || !self::table_exists($reviews))return;
+        $transaction=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$ledger} WHERE id=%d",$ledger_id));
+        if(!$transaction)return;
+        $wpdb->replace($reviews,['ledger_id'=>$ledger_id,'reviewed_by'=>$user->ID,'reviewed_at'=>current_time('mysql')],['%d','%d','%s']);
+        self::audit(
+            'wallet_reviewed',
+            'wallet',
+            (string) $ledger_id,
+            'Marked wallet transaction as reviewed: ' . ($transaction->reference ?: 'Ledger #' . $ledger_id),
+            [
+                'ledger_id' => $ledger_id,
+                'phone'     => $transaction->phone_number,
+                'source'    => $transaction->source,
+                'amount'    => $transaction->amount,
+            ]
+        );
+        wp_safe_redirect(add_query_arg(['soc_section'=>'wallet','wallet_notice'=>'reviewed'],home_url('/'.self::CONSOLE_SLUG.'/')));
+        exit;
+    }
+
     public static function handle_campaign_actions() {
         if (!is_user_logged_in() || !self::is_staff()) return;
         if (empty($_POST['surface_operations_campaign_action'])) return;
@@ -1385,6 +1522,34 @@ final class Surface_Operations_Console {
             $campaign_table = $wpdb->prefix . 'surface_campaigns';
             if (self::table_exists($campaign_table)) $view_campaign = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$campaign_table} WHERE id=%d", $view_campaign_id));
         }
+        $wallet_search = sanitize_text_field(wp_unslash($_GET['wallet_search'] ?? ''));
+        $wallet_transactions = $section === 'wallet' ? self::wallet_transactions($wallet_search) : [];
+        $wallet_totals = $section === 'wallet' ? self::wallet_summary() : ['balance'=>0,'credits'=>0,'debits'=>0,'pending'=>0,'failed'=>0];
+        $wallet_reviews = $section === 'wallet' ? self::wallet_reviews() : [];
+        $wallet_notice = sanitize_key(wp_unslash($_GET['wallet_notice'] ?? ''));
+        $view_wallet_id = absint($_GET['view_wallet'] ?? 0);
+        $view_wallet = false;
+        if ($view_wallet_id) {
+            global $wpdb;
+            $wallet_ledger = $wpdb->prefix . 'surface_kx_wallet_ledger';
+            if (self::table_exists($wallet_ledger)) {
+                $view_wallet = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wallet_ledger} WHERE id=%d", $view_wallet_id));
+                if ($view_wallet) {
+                    self::audit(
+                        'wallet_viewed',
+                        'wallet',
+                        (string) $view_wallet_id,
+                        'Viewed wallet transaction: ' . ($view_wallet->reference ?: 'Ledger #' . $view_wallet_id),
+                        [
+                            'ledger_id' => $view_wallet_id,
+                            'phone'     => $view_wallet->phone_number,
+                            'source'    => $view_wallet->source,
+                            'amount'    => $view_wallet->amount,
+                        ]
+                    );
+                }
+            }
+        }
 
         ob_start(); ?>
         <style>
@@ -1453,6 +1618,14 @@ final class Surface_Operations_Console {
                 <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">Campaign Details</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Back to Campaigns</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Campaign Name</span><strong><?php echo esc_html($view_campaign->campaign_name); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vc_partner); ?></strong></div><div class="soc-profile-field"><span>SurfaceTooth</span><strong><?php echo esc_html($vc_tooth ? $vc_tooth->post_title : 'Receipt SurfaceTooth'); ?></strong></div><div class="soc-profile-field"><span>Campaign Type</span><strong><?php echo esc_html(ucfirst((string)($view_campaign->campaign_scope ?? 'partner')).' Receipt Campaign'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst(self::campaign_status($view_campaign))); ?></strong></div><div class="soc-profile-field"><span>Start Date</span><strong><?php echo esc_html(!empty($view_campaign->preferred_start_date) ? mysql2date('M j, Y',$view_campaign->preferred_start_date) : 'Immediate'); ?></strong></div><div class="soc-profile-field"><span>End Date</span><strong><?php echo esc_html(!empty($view_campaign->end_date) ? $view_campaign->end_date : 'Not specified'); ?></strong></div><div class="soc-profile-field"><span>Target</span><strong><?php echo esc_html((string)($view_campaign->target_value ?? 'Not specified')); ?></strong></div><div class="soc-profile-field"><span>Expected Winners</span><strong><?php echo esc_html(absint($view_campaign->expected_winners ?? 0)); ?></strong></div><div class="soc-profile-field"><span>Current Winners</span><strong><?php echo esc_html($vc_counts['winners']); ?></strong></div><div class="soc-profile-field"><span>Participation Count</span><strong><?php echo esc_html($vc_counts['participation']); ?></strong></div><div class="soc-profile-field"><span>Progress</span><strong><?php echo esc_html(self::campaign_progress($view_campaign)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Cashback Configuration</span><strong><?php echo esc_html(self::campaign_cashback_summary($view_campaign->id)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Grand Cashback Configuration</span><strong><?php echo esc_html(self::campaign_grand_cashback($view_campaign)); ?></strong></div></div></section>
             <?php endif; ?>
             <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="campaigns"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="campaign_search" value="<?php echo esc_attr($campaign_search); ?>" placeholder="Search campaign, partner or SII"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','campaigns',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Campaign</th><th>Partner</th><th>SurfaceTooth</th><th>Type</th><th>Start</th><th>End</th><th>Status</th><th>Progress</th><th>Actions</th></tr></thead><tbody><?php if(!$campaigns): ?><tr><td colspan="9" class="soc-empty">No campaigns found. Receipt campaigns will appear here when available.</td></tr><?php endif; ?><?php foreach($campaigns as $campaign): $cs=self::campaign_status($campaign);$ct=self::campaign_surfacetooth($campaign); ?><tr><td><strong><?php echo esc_html($campaign->campaign_name); ?></strong></td><td><?php echo esc_html(self::campaign_partner_name($campaign->partner_id ?? 0)); ?></td><td><?php echo esc_html($ct?$ct->post_title:'Receipt SurfaceTooth'); ?></td><td><?php echo esc_html(ucfirst((string)($campaign->campaign_scope ?? 'partner'))); ?></td><td><?php echo esc_html(!empty($campaign->preferred_start_date)?mysql2date('M j, Y',$campaign->preferred_start_date):'Immediate'); ?></td><td><?php echo esc_html(!empty($campaign->end_date)?$campaign->end_date:'—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($cs)); ?></span></td><td><?php echo esc_html(self::campaign_progress($campaign)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'campaigns','view_campaign'=>$campaign->id],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_campaign','surface_operations_campaign_nonce'); ?><input type="hidden" name="campaign_id" value="<?php echo esc_attr($campaign->id); ?>"><input type="hidden" name="surface_operations_campaign_action" value="<?php echo esc_attr($cs==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $cs==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($cs==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+        <?php elseif($section==='wallet'): ?>
+            <div class="soc-top"><div><h1>Wallet Operations Centre</h1><p>Monitor wallet balances and transaction activity without changing financial records.</p></div></div>
+            <?php if($wallet_notice): ?><div class="soc-alert">Transaction marked as reviewed.</div><?php endif; ?>
+            <section class="soc-grid" style="grid-template-columns:repeat(5,minmax(0,1fr));margin-bottom:18px"><div class="soc-stat"><span>Total Wallet Balance</span><strong>₦<?php echo esc_html(number_format((float)$wallet_totals['balance'],2)); ?></strong></div><div class="soc-stat"><span>Total Credits</span><strong>₦<?php echo esc_html(number_format((float)$wallet_totals['credits'],2)); ?></strong></div><div class="soc-stat"><span>Total Debits</span><strong>₦<?php echo esc_html(number_format((float)$wallet_totals['debits'],2)); ?></strong></div><div class="soc-stat"><span>Pending Transactions</span><strong><?php echo esc_html($wallet_totals['pending']); ?></strong></div><div class="soc-stat"><span>Failed Transactions</span><strong><?php echo esc_html($wallet_totals['failed']); ?></strong></div></section>
+            <?php if($view_wallet): $vw_owner=self::wallet_owner($view_wallet->phone_number);$vw_context=self::wallet_related_context($view_wallet);$vw_reviewed=!empty($wallet_reviews[(int)$view_wallet->id]); ?>
+            <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">Transaction Details</h2><p>Read-only financial record.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','wallet',$base_url)); ?>">Back to Wallet</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Reference</span><strong><?php echo esc_html($view_wallet->reference ?: 'Ledger #'.$view_wallet->id); ?></strong></div><div class="soc-profile-field"><span>Wallet Owner</span><strong><?php echo esc_html($vw_owner?$vw_owner->display_name:'Unknown wallet owner'); ?></strong></div><div class="soc-profile-field"><span>Phone Number</span><strong><?php echo esc_html($view_wallet->phone_number); ?></strong></div><div class="soc-profile-field"><span>Partner / SII</span><strong><?php echo esc_html($vw_owner?(self::partner_sii($vw_owner->ID) ?: 'Not a registered partner'):'Not linked'); ?></strong></div><div class="soc-profile-field"><span>Amount</span><strong><?php echo esc_html(($view_wallet->amount<0?'-':'').'₦'.number_format(abs((float)$view_wallet->amount),2)); ?></strong></div><div class="soc-profile-field"><span>Transaction Type</span><strong><?php echo esc_html($view_wallet->amount<0?'Debit':'Credit'); ?></strong></div><div class="soc-profile-field"><span>Source</span><strong><?php echo esc_html(self::wallet_source_label($view_wallet->source)); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong>Completed<?php echo $vw_reviewed?' · Reviewed':''; ?></strong></div><div class="soc-profile-field"><span>Date / Time</span><strong><?php echo esc_html(mysql2date('M j, Y g:i a',$view_wallet->created_at)); ?></strong></div><div class="soc-profile-field"><span>Balance After</span><strong>₦<?php echo esc_html(number_format((float)$view_wallet->balance_after,2)); ?></strong></div><div class="soc-profile-field"><span>Related Campaign</span><strong><?php echo esc_html($vw_context['campaign']); ?></strong></div><div class="soc-profile-field"><span>Related SurfaceTooth</span><strong><?php echo esc_html($vw_context['surfacetooth']); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Notes</span><strong>Original wallet ledger record. Financial values cannot be changed from the Operations Console.</strong></div></div></section>
+            <?php endif; ?>
+            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="wallet"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="wallet_search" value="<?php echo esc_attr($wallet_search); ?>" placeholder="Search reference, phone, partner or SII"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','wallet',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Reference</th><th>Partner / User</th><th>Type</th><th>Amount</th><th>Status</th><th>Date</th><th>Actions</th></tr></thead><tbody><?php if(!$wallet_transactions): ?><tr><td colspan="7" class="soc-empty">No wallet transactions found. Transactions will appear here when the wallet ledger is available.</td></tr><?php endif; ?><?php foreach($wallet_transactions as $transaction): $wt_owner=self::wallet_owner($transaction->phone_number);$wt_reviewed=!empty($wallet_reviews[(int)$transaction->id]); ?><tr><td><strong><?php echo esc_html($transaction->reference ?: 'Ledger #'.$transaction->id); ?></strong><div class="soc-meta"><?php echo esc_html($transaction->phone_number); ?></div></td><td><?php echo esc_html($wt_owner?$wt_owner->display_name:'Unknown wallet owner'); ?><?php if($wt_owner && self::partner_sii($wt_owner->ID)): ?><div class="soc-meta">/<?php echo esc_html(self::partner_sii($wt_owner->ID)); ?></div><?php endif; ?></td><td><?php echo esc_html(self::wallet_source_label($transaction->source)); ?></td><td><strong><?php echo esc_html(($transaction->amount<0?'-':'').'₦'.number_format(abs((float)$transaction->amount),2)); ?></strong></td><td><span class="soc-badge">Completed<?php echo $wt_reviewed?' · Reviewed':''; ?></span></td><td><?php echo esc_html(mysql2date('M j, Y g:i a',$transaction->created_at)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'wallet','view_wallet'=>$transaction->id],$base_url)); ?>">View</a><?php if(!$wt_reviewed): ?><form method="post"><?php wp_nonce_field('surface_operations_wallet','surface_operations_wallet_nonce'); ?><input type="hidden" name="ledger_id" value="<?php echo esc_attr($transaction->id); ?>"><input type="hidden" name="surface_operations_wallet_action" value="review"><button class="soc-btn" type="submit">Mark Reviewed</button></form><?php endif; ?></div></td></tr><?php endforeach; ?></tbody></table></div></section>
         <?php elseif($section==='audit'): ?>
             <div class="soc-top"><div><h1>Audit Centre</h1><p>Review who did what, where and when across Surface Operations.</p></div></div>
             <section class="soc-panel">
