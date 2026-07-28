@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.4.1
+ * Version: 1.4.2
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.4.1';
+    const VERSION = '1.4.2';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -31,6 +31,7 @@ final class Surface_Operations_Console {
         add_action('template_redirect', [__CLASS__, 'handle_campaign_actions'], 8);
         add_action('template_redirect', [__CLASS__, 'handle_wallet_actions'], 9);
         add_action('template_redirect', [__CLASS__, 'handle_bundle_actions'], 10);
+        add_action('template_redirect', [__CLASS__, 'handle_advocate_actions'], 11);
         add_action('template_redirect', [__CLASS__, 'guard_staff_frontend'], 20);
 
         add_shortcode('surface_staff_login', [__CLASS__, 'render_login']);
@@ -1466,6 +1467,52 @@ final class Surface_Operations_Console {
     }
 
 
+    private static function advocates($search = '') {
+        $users = get_users(['meta_key'=>'surface_is_advocate','meta_value'=>'yes','orderby'=>'display_name','order'=>'ASC','number'=>500]);
+        if ($search === '') return $users;
+        $n = strtolower($search);
+        return array_values(array_filter($users, function($u) use ($n) {
+            $phone=(string)get_user_meta($u->ID,'surface_phone',true);
+            $sii=self::advocate_sii($u->ID);
+            return strpos(strtolower($u->display_name.' '.$u->user_email.' '.$phone.' '.$sii),$n)!==false;
+        }));
+    }
+    private static function advocate_sii($id) { return trim((string)(get_user_meta($id,'surface_name',true) ?: get_user_meta($id,'surface_sii',true))); }
+    private static function advocate_status($id) {
+        $s=sanitize_key((string)get_user_meta($id,'surface_advocate_status',true));
+        return $s==='suspended'?'suspended':(in_array($s,['active','approved'],true)?'active':'pending');
+    }
+    private static function advocate_introduced($id,$mission=false) {
+        $sii=self::advocate_sii($id); if($sii==='') return 0;
+        $ids=get_users(['meta_key'=>'introduced_by','meta_value'=>$sii,'fields'=>'ID','number'=>-1]);
+        if(!$mission) return count($ids); $c=0; foreach($ids as $pid) if(get_user_meta($pid,'surface_onboarding_saved',true)) $c++; return $c;
+    }
+    private static function advocate_financials($id) {
+        global $wpdb; $r=['earnings'=>0.0,'balance'=>0.0,'activity'=>[]];
+        $phone=trim((string)get_user_meta($id,'surface_phone',true)); if($phone==='') return $r;
+        $wt=$wpdb->prefix.'surface_kx_wallets'; $lt=$wpdb->prefix.'surface_kx_wallet_ledger';
+        if(self::table_exists($wt)) $r['balance']=(float)$wpdb->get_var($wpdb->prepare("SELECT balance FROM {$wt} WHERE phone_number=%s LIMIT 1",$phone));
+        if(self::table_exists($lt)) {
+            $r['earnings']=(float)$wpdb->get_var($wpdb->prepare("SELECT COALESCE(SUM(amount),0) FROM {$lt} WHERE phone_number=%s AND source IN ('advocate_introduction_credit','advocate_bundle_credit')",$phone));
+            $r['activity']=$wpdb->get_results($wpdb->prepare("SELECT source,reference,amount,created_at FROM {$lt} WHERE phone_number=%s AND source IN ('advocate_introduction_credit','advocate_bundle_credit') ORDER BY id DESC LIMIT 10",$phone));
+        } return $r;
+    }
+    private static function advocate_summary() {
+        $r=['total'=>0,'active'=>0,'pending'=>0,'suspended'=>0,'introduced'=>0,'earnings'=>0.0];
+        foreach(self::advocates() as $a){$r['total']++;$r[self::advocate_status($a->ID)]++;$r['introduced']+=self::advocate_introduced($a->ID);$r['earnings']+=self::advocate_financials($a->ID)['earnings'];} return $r;
+    }
+    public static function handle_advocate_actions() {
+        if(empty($_POST['surface_operations_advocate_action']) || !is_user_logged_in() || !self::is_staff()) return;
+        $u=wp_get_current_user(); if(!self::can_access('advocates',$u->ID)) return;
+        check_admin_referer('surface_operations_advocate','surface_operations_advocate_nonce');
+        $id=absint($_POST['advocate_id']??0); $a=$id?get_user_by('id',$id):false;
+        if(!$a || get_user_meta($id,'surface_is_advocate',true)!=='yes') return;
+        $action=sanitize_key(wp_unslash($_POST['surface_operations_advocate_action'])); $map=['approve'=>'active','suspend'=>'suspended','reactivate'=>'active']; if(!isset($map[$action])) return;
+        update_user_meta($id,'surface_advocate_status',$map[$action]); if($action==='approve') update_user_meta($id,'surface_advocate_approved_at',current_time('mysql'));
+        self::audit('advocate_'.$action,'advocate',(string)$id,ucfirst($action).'d advocate: '.$a->display_name,['sii'=>self::advocate_sii($id),'status'=>$map[$action]]);
+        wp_safe_redirect(add_query_arg(['soc_section'=>'advocates','advocate_notice'=>$action,'view_advocate'=>$id],home_url('/'.self::CONSOLE_SLUG.'/'))); exit;
+    }
+
     private static function bundle_table() {
         global $wpdb;
         return $wpdb->prefix . 'surface_bundles';
@@ -1630,6 +1677,14 @@ final class Surface_Operations_Console {
             $campaign_table = $wpdb->prefix . 'surface_campaigns';
             if (self::table_exists($campaign_table)) $view_campaign = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$campaign_table} WHERE id=%d", $view_campaign_id));
         }
+        $advocate_search=sanitize_text_field(wp_unslash($_GET['advocate_search']??''));
+        $advocates=$section==='advocates'?self::advocates($advocate_search):[];
+        $advocate_totals=$section==='advocates'?self::advocate_summary():['total'=>0,'active'=>0,'pending'=>0,'suspended'=>0,'introduced'=>0,'earnings'=>0];
+        $advocate_notice=sanitize_key(wp_unslash($_GET['advocate_notice']??''));
+        $view_advocate_id=absint($_GET['view_advocate']??0); $view_advocate=$view_advocate_id?get_user_by('id',$view_advocate_id):false;
+        if($view_advocate && get_user_meta($view_advocate_id,'surface_is_advocate',true)!=='yes') $view_advocate=false;
+        $view_advocate_financials=$view_advocate?self::advocate_financials($view_advocate_id):['earnings'=>0,'balance'=>0,'activity'=>[]];
+        if($view_advocate && $section==='advocates') self::audit('advocate_viewed','advocate',(string)$view_advocate_id,'Viewed advocate: '.$view_advocate->display_name,['sii'=>self::advocate_sii($view_advocate_id)]);
         $bundle_search = sanitize_text_field(wp_unslash($_GET['bundle_search'] ?? ''));
         $bundles = $section === 'bundles' ? self::bundles($bundle_search) : [];
         $bundle_totals = $section === 'bundles' ? self::bundle_summary() : ['total'=>0,'active'=>0,'expired'=>0,'used'=>0,'remaining'=>0];
@@ -1728,6 +1783,12 @@ final class Surface_Operations_Console {
                 <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">SurfaceTooth Details</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Back to SurfaceTeeth</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Title</span><strong><?php echo esc_html($view_surfacetooth->post_title); ?></strong></div><div class="soc-profile-field"><span>Type</span><strong><?php echo esc_html(self::surfacetooth_type($view_surfacetooth).' SurfaceTooth'); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vt_store ?: ($vt_partner ? $vt_partner->display_name : 'Unknown partner')); ?></strong></div><div class="soc-profile-field"><span>SII</span><strong>/<?php echo esc_html(self::surfacetooth_sii($view_surfacetooth) ?: 'Not assigned'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst(self::surfacetooth_status($view_surfacetooth))); ?></strong></div><div class="soc-profile-field"><span>Channels</span><strong><?php echo esc_html(self::surfacetooth_channels($view_surfacetooth)); ?></strong></div><div class="soc-profile-field"><span>Bundle Summary</span><strong><?php echo esc_html($vt_partner_id?self::partner_bundle_summary($vt_partner_id):'Not available'); ?></strong></div><div class="soc-profile-field"><span>Created</span><strong><?php echo esc_html(mysql2date('M j, Y',$view_surfacetooth->post_date)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Description</span><strong><?php echo nl2br(esc_html(self::surfacetooth_description($view_surfacetooth) ?: 'No description available')); ?></strong></div></div></section>
             <?php endif; ?>
             <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="surfaceteeth"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="surfacetooth_search" value="<?php echo esc_attr($surfacetooth_search); ?>" placeholder="Search title, SII or partner"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Title</th><th>Type</th><th>Partner</th><th>SII</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead><tbody><?php if(!$surfaceteeth): ?><tr><td colspan="7" class="soc-empty">No SurfaceTeeth found.</td></tr><?php endif; ?><?php foreach($surfaceteeth as $tooth): $ts=self::surfacetooth_status($tooth); $tp_id=self::surfacetooth_partner_id($tooth); $tp=$tp_id?get_user_by('id',$tp_id):false; $tp_store=$tp_id?(string)get_user_meta($tp_id,'surface_store',true):''; ?><tr><td><strong><?php echo esc_html($tooth->post_title); ?></strong></td><td><?php echo esc_html(self::surfacetooth_type($tooth)); ?></td><td><?php echo esc_html($tp_store ?: ($tp?$tp->display_name:'Unknown')); ?></td><td>/<?php echo esc_html(self::surfacetooth_sii($tooth) ?: '—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ts)); ?></span></td><td><?php echo esc_html(mysql2date('M j, Y',$tooth->post_date)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'surfaceteeth','view_surfacetooth'=>$tooth->ID],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_surfacetooth','surface_operations_surfacetooth_nonce'); ?><input type="hidden" name="surfacetooth_id" value="<?php echo esc_attr($tooth->ID); ?>"><input type="hidden" name="surface_operations_surfacetooth_action" value="<?php echo esc_attr($ts==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $ts==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($ts==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+        <?php elseif($section==='advocates'):
+            if($advocate_notice): ?><div class="soc-notice">Advocate action completed: <?php echo esc_html($advocate_notice); ?>.</div><?php endif; ?>
+            <section class="soc-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:18px"><div class="soc-stat"><span>Total Advocates</span><strong><?php echo esc_html($advocate_totals['total']); ?></strong></div><div class="soc-stat"><span>Active Advocates</span><strong><?php echo esc_html($advocate_totals['active']); ?></strong></div><div class="soc-stat"><span>Pending Approval</span><strong><?php echo esc_html($advocate_totals['pending']); ?></strong></div><div class="soc-stat"><span>Suspended Advocates</span><strong><?php echo esc_html($advocate_totals['suspended']); ?></strong></div><div class="soc-stat"><span>Introduced Partners</span><strong><?php echo esc_html($advocate_totals['introduced']); ?></strong></div><div class="soc-stat"><span>Total Advocacy Earnings</span><strong>₦<?php echo esc_html(number_format($advocate_totals['earnings'],2)); ?></strong></div></section>
+            <?php if($view_advocate): $st=self::advocate_status($view_advocate->ID);$sii=self::advocate_sii($view_advocate->ID);$joined=get_user_meta($view_advocate->ID,'surface_advocate_joined',true); ?>
+            <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top"><div><h2>Advocate Profile</h2><p>Read-only advocacy activity and operational controls.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','advocates',$base_url)); ?>">Back to Advocates</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Name</span><strong><?php echo esc_html($view_advocate->display_name); ?></strong></div><div class="soc-profile-field"><span>SII</span><strong><?php echo esc_html($sii?'/'.$sii:'Not assigned'); ?></strong></div><div class="soc-profile-field"><span>Email</span><strong><?php echo esc_html($view_advocate->user_email?:'Not provided'); ?></strong></div><div class="soc-profile-field"><span>Phone</span><strong><?php echo esc_html(get_user_meta($view_advocate->ID,'surface_phone',true)?:'Not provided'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst($st)); ?></strong></div><div class="soc-profile-field"><span>Date Joined</span><strong><?php echo esc_html($joined?wp_date('M j, Y',(int)$joined):'Not recorded'); ?></strong></div><div class="soc-profile-field"><span>Introduced Partners</span><strong><?php echo esc_html(self::advocate_introduced($view_advocate->ID)); ?></strong></div><div class="soc-profile-field"><span>Introduced Mission Partners</span><strong><?php echo esc_html(self::advocate_introduced($view_advocate->ID,true)); ?></strong></div><div class="soc-profile-field"><span>Total Advocacy Earnings</span><strong>₦<?php echo esc_html(number_format($view_advocate_financials['earnings'],2)); ?></strong></div><div class="soc-profile-field"><span>Wallet Balance</span><strong>₦<?php echo esc_html(number_format($view_advocate_financials['balance'],2)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Referral Link</span><strong><?php echo esc_html(home_url('/surface-internet-registry/?advocate='.rawurlencode($sii))); ?></strong></div></div><div class="soc-actions" style="margin-top:16px"><form method="post"><?php wp_nonce_field('surface_operations_advocate','surface_operations_advocate_nonce'); ?><input type="hidden" name="advocate_id" value="<?php echo esc_attr($view_advocate->ID); ?>"><input type="hidden" name="surface_operations_advocate_action" value="<?php echo esc_attr($st==='pending'?'approve':($st==='suspended'?'reactivate':'suspend')); ?>"><button class="soc-btn" type="submit"><?php echo esc_html($st==='pending'?'Approve':($st==='suspended'?'Reactivate':'Suspend')); ?></button></form></div></section><?php endif; ?>
+            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="advocates"><label style="flex:1">Search<input style="width:100%" type="search" name="advocate_search" value="<?php echo esc_attr($advocate_search); ?>" placeholder="Search advocate name, phone, SII or email"></label><button class="soc-btn">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','advocates',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Advocate</th><th>Phone</th><th>SII</th><th>Status</th><th>Introduced</th><th>Mission Partners</th><th>Total Earnings</th><th>Joined</th><th>Actions</th></tr></thead><tbody><?php if(!$advocates): ?><tr><td colspan="9" class="soc-empty">No advocates found.</td></tr><?php endif; foreach($advocates as $a): $ast=self::advocate_status($a->ID);$af=self::advocate_financials($a->ID);$aj=get_user_meta($a->ID,'surface_advocate_joined',true); ?><tr><td><strong><?php echo esc_html($a->display_name); ?></strong><div class="soc-meta"><?php echo esc_html($a->user_email); ?></div></td><td><?php echo esc_html(get_user_meta($a->ID,'surface_phone',true)?:'—'); ?></td><td><?php echo esc_html(self::advocate_sii($a->ID)?'/'.self::advocate_sii($a->ID):'—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ast)); ?></span></td><td><?php echo esc_html(self::advocate_introduced($a->ID)); ?></td><td><?php echo esc_html(self::advocate_introduced($a->ID,true)); ?></td><td>₦<?php echo esc_html(number_format($af['earnings'],2)); ?></td><td><?php echo esc_html($aj?wp_date('M j, Y',(int)$aj):'—'); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'advocates','view_advocate'=>$a->ID],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_advocate','surface_operations_advocate_nonce'); ?><input type="hidden" name="advocate_id" value="<?php echo esc_attr($a->ID); ?>"><input type="hidden" name="surface_operations_advocate_action" value="<?php echo esc_attr($ast==='pending'?'approve':($ast==='suspended'?'reactivate':'suspend')); ?>"><button class="soc-btn soc-btn-light"><?php echo esc_html($ast==='pending'?'Approve':($ast==='suspended'?'Reactivate':'Suspend')); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
         <?php elseif($section==='campaigns'):
             $all_campaigns=self::campaigns('');
             $campaign_counts=['total'=>count($all_campaigns),'active'=>0,'scheduled'=>0,'ended'=>0,'suspended'=>0];
