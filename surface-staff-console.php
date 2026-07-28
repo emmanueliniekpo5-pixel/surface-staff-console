@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.3.7
+ * Version: 1.3.8
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.3.7';
+    const VERSION = '1.3.8';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -27,6 +27,7 @@ final class Surface_Operations_Console {
         add_action('template_redirect', [__CLASS__, 'handle_front_auth'], 1);
         add_action('template_redirect', [__CLASS__, 'handle_task_actions'], 5);
         add_action('template_redirect', [__CLASS__, 'handle_partner_actions'], 6);
+        add_action('template_redirect', [__CLASS__, 'handle_surfacetooth_actions'], 7);
         add_action('template_redirect', [__CLASS__, 'guard_staff_frontend'], 20);
 
         add_shortcode('surface_staff_login', [__CLASS__, 'render_login']);
@@ -1091,6 +1092,130 @@ final class Surface_Operations_Console {
         return $partners;
     }
 
+    public static function handle_surfacetooth_actions() {
+        if (!is_user_logged_in() || !self::is_staff()) return;
+        if (empty($_POST['surface_operations_surfacetooth_action'])) return;
+
+        $user = wp_get_current_user();
+        if (!self::can_access('surfaceteeth', $user->ID)) return;
+
+        check_admin_referer('surface_operations_surfacetooth', 'surface_operations_surfacetooth_nonce');
+
+        $post_id = absint($_POST['surfacetooth_id'] ?? 0);
+        $post = $post_id ? get_post($post_id) : null;
+        if (!$post || !in_array($post->post_type, ['product', 'surface_signal'], true)) return;
+        if (!get_post_meta($post_id, '_surface_partner_user_id', true) && !$post->post_author) return;
+
+        $action = sanitize_key(wp_unslash($_POST['surface_operations_surfacetooth_action']));
+        if (!in_array($action, ['suspend', 'reactivate'], true)) return;
+
+        $new_status = $action === 'suspend' ? 'suspended' : 'active';
+        update_post_meta($post_id, '_surface_operations_surfacetooth_status', $new_status);
+
+        self::audit(
+            'surfacetooth.' . $new_status,
+            'surfacetooth',
+            (string) $post_id,
+            ucfirst($new_status) . ' SurfaceTooth: ' . get_the_title($post_id),
+            [
+                'type' => self::surfacetooth_type($post),
+                'sii'  => self::surfacetooth_sii($post),
+            ]
+        );
+
+        $redirect = add_query_arg([
+            'soc_section' => 'surfaceteeth',
+            'surfacetooth_notice' => $new_status,
+        ], home_url('/' . self::CONSOLE_SLUG . '/'));
+        wp_safe_redirect($redirect);
+        exit;
+    }
+
+    private static function surfacetooth_partner_id($post) {
+        if (!$post) return 0;
+        $partner_id = absint(get_post_meta($post->ID, '_surface_partner_user_id', true));
+        return $partner_id ?: absint($post->post_author);
+    }
+
+    private static function surfacetooth_type($post) {
+        if (!$post) return 'Unknown';
+        if ($post->post_type === 'product') return 'Market';
+        if ($post->post_type === 'surface_signal') {
+            $signal_type = sanitize_key((string) get_post_meta($post->ID, '_surface_signal_type', true));
+            $service_types = [
+                'artisans','professional_services','home_services','health_wellness',
+                'beauty_grooming','education_training','technology_digital','automotive',
+                'hospitality_events','logistics_delivery','creative_services','other_services',
+                'properties'
+            ];
+            return in_array($signal_type, $service_types, true) ? 'Service' : 'Broadcast';
+        }
+        return 'Unknown';
+    }
+
+    private static function surfacetooth_status($post) {
+        if (!$post) return 'draft';
+        $status = sanitize_key((string) get_post_meta($post->ID, '_surface_operations_surfacetooth_status', true));
+        if (in_array($status, ['active', 'draft', 'suspended'], true)) return $status;
+        return $post->post_status === 'publish' ? 'active' : 'draft';
+    }
+
+    private static function surfacetooth_sii($post) {
+        if (!$post) return '';
+        if ($post->post_type === 'product') {
+            return trim((string) get_post_meta($post->ID, '_sku', true), " /@#\t\n\r\0\x0B");
+        }
+        $kxcode = (string) get_post_meta($post->ID, '_surface_kxcode', true);
+        if ($kxcode !== '') return trim($kxcode, " /@#\t\n\r\0\x0B");
+        $target = trim((string) get_post_meta($post->ID, '_surface_signal_target', true), " /@#\t\n\r\0\x0B");
+        $suffix = trim((string) get_post_meta($post->ID, '_surface_signal_suffix', true), " /@#\t\n\r\0\x0B");
+        return trim($target . ($target && $suffix ? '/' : '') . $suffix, '/');
+    }
+
+    private static function surfacetooth_description($post) {
+        if (!$post) return '';
+        if ($post->post_type === 'surface_signal') {
+            $message = (string) get_post_meta($post->ID, '_surface_signal_message', true);
+            if ($message !== '') return $message;
+        }
+        return $post->post_excerpt ?: wp_strip_all_tags($post->post_content);
+    }
+
+    private static function surfacetooth_channels($post) {
+        if (!$post) return 'Not specified';
+        $items = [];
+        if ($post->post_type === 'surface_signal') {
+            $target = (string) get_post_meta($post->ID, '_surface_signal_target', true);
+            $cta = (string) get_post_meta($post->ID, '_surface_signal_cta_url', true);
+            if ($target !== '') $items[] = 'Surface target';
+            if ($cta !== '') $items[] = 'CTA destination';
+        } else {
+            $items[] = 'Market destination';
+        }
+        return $items ? implode(' · ', array_unique($items)) : 'Not specified';
+    }
+
+    private static function surface_teeth($search = '') {
+        global $wpdb;
+        $sql = "SELECT DISTINCT p.* FROM {$wpdb->posts} p INNER JOIN {$wpdb->postmeta} pm ON pm.post_id=p.ID AND pm.meta_key='_surface_partner_user_id' WHERE p.post_type IN ('product','surface_signal') AND p.post_status NOT IN ('trash','auto-draft') ORDER BY p.post_date DESC";
+        $posts = $wpdb->get_results($sql);
+
+        $search = strtolower(trim((string) $search));
+        if ($search === '') return $posts;
+
+        return array_values(array_filter($posts, function($post) use ($search) {
+            $partner_id = self::surfacetooth_partner_id($post);
+            $partner = $partner_id ? get_user_by('id', $partner_id) : false;
+            $partner_name = $partner ? $partner->display_name : '';
+            $store = $partner_id ? (string) get_user_meta($partner_id, 'surface_store', true) : '';
+            $haystack = strtolower(
+                $post->post_title . ' ' . self::surfacetooth_sii($post) . ' ' .
+                self::surfacetooth_type($post) . ' ' . $partner_name . ' ' . $store
+            );
+            return strpos($haystack, $search) !== false;
+        }));
+    }
+
     public static function render_console() {
         if (!is_user_logged_in() || !self::is_staff()) {
             return '<script>window.location.href=' . wp_json_encode(home_url('/' . self::LOGIN_SLUG . '/')) . ';</script>';
@@ -1133,6 +1258,12 @@ final class Surface_Operations_Console {
         $view_partner_id = absint($_GET['view_partner'] ?? 0);
         $view_partner = $view_partner_id ? get_user_by('id', $view_partner_id) : false;
         if ($view_partner && !self::is_surface_partner($view_partner)) $view_partner = false;
+        $surfacetooth_search = sanitize_text_field(wp_unslash($_GET['surfacetooth_search'] ?? ''));
+        $surfaceteeth = $section === 'surfaceteeth' ? self::surface_teeth($surfacetooth_search) : [];
+        $surfacetooth_notice = sanitize_key(wp_unslash($_GET['surfacetooth_notice'] ?? ''));
+        $view_surfacetooth_id = absint($_GET['view_surfacetooth'] ?? 0);
+        $view_surfacetooth = $view_surfacetooth_id ? get_post($view_surfacetooth_id) : null;
+        if ($view_surfacetooth && !in_array($view_surfacetooth->post_type, ['product','surface_signal'], true)) $view_surfacetooth = null;
 
         ob_start(); ?>
         <style>
@@ -1168,6 +1299,23 @@ final class Surface_Operations_Console {
                 <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">Partner Profile</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','partners',$base_url)); ?>">Back to Partners</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Business Name</span><strong><?php echo esc_html($vp_store ?: $view_partner->display_name); ?></strong></div><div class="soc-profile-field"><span>SII</span><strong>/<?php echo esc_html(self::partner_sii($view_partner->ID) ?: 'Not assigned'); ?></strong></div><div class="soc-profile-field"><span>Owner</span><strong><?php echo esc_html($view_partner->display_name); ?></strong></div><div class="soc-profile-field"><span>Email</span><strong><?php echo esc_html($vp_email ?: 'Not available'); ?></strong></div><div class="soc-profile-field"><span>Phone</span><strong><?php echo esc_html($vp_phone ?: 'Not available'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst($vp_status)); ?></strong></div><div class="soc-profile-field"><span>SurfaceTeeth</span><strong><?php echo esc_html(self::partner_surfaceteeth_count($view_partner->ID)); ?></strong></div><div class="soc-profile-field"><span>Bundle Summary</span><strong><?php echo esc_html(self::partner_bundle_summary($view_partner->ID)); ?></strong></div><div class="soc-profile-field"><span>Wallet Balance</span><strong><?php echo esc_html(self::partner_wallet_balance($view_partner->ID)); ?></strong></div><div class="soc-profile-field"><span>Date Joined</span><strong><?php echo esc_html(mysql2date('M j, Y',$view_partner->user_registered)); ?></strong></div></div></section>
             <?php endif; ?>
             <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="partners"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="partner_search" value="<?php echo esc_attr($partner_search); ?>" placeholder="Search Partner Name, SII or Email"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','partners',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Partner</th><th>SII</th><th>SurfaceTeeth</th><th>Status</th><th>Joined</th><th>Actions</th></tr></thead><tbody><?php if(!$partners): ?><tr><td colspan="6" class="soc-empty">No partners found.</td></tr><?php endif; ?><?php foreach($partners as $partner): $ps=self::partner_status($partner->ID); $store=(string)get_user_meta($partner->ID,'surface_store',true); ?><tr><td><strong><?php echo esc_html($store ?: $partner->display_name); ?></strong><div class="soc-meta"><?php echo esc_html($partner->user_email); ?></div></td><td>/<?php echo esc_html(self::partner_sii($partner->ID) ?: '—'); ?></td><td><?php echo esc_html(self::partner_surfaceteeth_count($partner->ID)); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ps)); ?></span></td><td><?php echo esc_html(mysql2date('M j, Y',$partner->user_registered)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'partners','view_partner'=>$partner->ID],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_partner','surface_operations_partner_nonce'); ?><input type="hidden" name="partner_id" value="<?php echo esc_attr($partner->ID); ?>"><input type="hidden" name="surface_operations_partner_action" value="<?php echo esc_attr($ps==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $ps==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($ps==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
+        <?php elseif($section==='surfaceteeth'): ?>
+            <?php
+            $all_teeth=self::surface_teeth('');
+            $tooth_counts=['total'=>count($all_teeth),'active'=>0,'draft'=>0,'suspended'=>0];
+            foreach($all_teeth as $tooth){$ts=self::surfacetooth_status($tooth);if(isset($tooth_counts[$ts]))$tooth_counts[$ts]++;}
+            ?>
+            <div class="soc-top"><div><h1>SurfaceTeeth Operations</h1><p>Review partner SurfaceTeeth and control operational availability.</p></div></div>
+            <?php if($surfacetooth_notice): ?><div class="soc-alert">SurfaceTooth status updated.</div><?php endif; ?>
+            <section class="soc-grid" style="margin-bottom:18px"><div class="soc-stat"><span>Total SurfaceTeeth</span><strong><?php echo esc_html($tooth_counts['total']); ?></strong></div><div class="soc-stat"><span>Active</span><strong><?php echo esc_html($tooth_counts['active']); ?></strong></div><div class="soc-stat"><span>Draft</span><strong><?php echo esc_html($tooth_counts['draft']); ?></strong></div><div class="soc-stat"><span>Suspended</span><strong><?php echo esc_html($tooth_counts['suspended']); ?></strong></div></section>
+            <?php if($view_surfacetooth):
+                $vt_partner_id=self::surfacetooth_partner_id($view_surfacetooth);
+                $vt_partner=$vt_partner_id?get_user_by('id',$vt_partner_id):false;
+                $vt_store=$vt_partner_id?(string)get_user_meta($vt_partner_id,'surface_store',true):'';
+            ?>
+                <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">SurfaceTooth Details</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Back to SurfaceTeeth</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Title</span><strong><?php echo esc_html($view_surfacetooth->post_title); ?></strong></div><div class="soc-profile-field"><span>Type</span><strong><?php echo esc_html(self::surfacetooth_type($view_surfacetooth).' SurfaceTooth'); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vt_store ?: ($vt_partner ? $vt_partner->display_name : 'Unknown partner')); ?></strong></div><div class="soc-profile-field"><span>SII</span><strong>/<?php echo esc_html(self::surfacetooth_sii($view_surfacetooth) ?: 'Not assigned'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst(self::surfacetooth_status($view_surfacetooth))); ?></strong></div><div class="soc-profile-field"><span>Channels</span><strong><?php echo esc_html(self::surfacetooth_channels($view_surfacetooth)); ?></strong></div><div class="soc-profile-field"><span>Bundle Summary</span><strong><?php echo esc_html($vt_partner_id?self::partner_bundle_summary($vt_partner_id):'Not available'); ?></strong></div><div class="soc-profile-field"><span>Created</span><strong><?php echo esc_html(mysql2date('M j, Y',$view_surfacetooth->post_date)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Description</span><strong><?php echo nl2br(esc_html(self::surfacetooth_description($view_surfacetooth) ?: 'No description available')); ?></strong></div></div></section>
+            <?php endif; ?>
+            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="surfaceteeth"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="surfacetooth_search" value="<?php echo esc_attr($surfacetooth_search); ?>" placeholder="Search title, SII or partner"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Title</th><th>Type</th><th>Partner</th><th>SII</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead><tbody><?php if(!$surfaceteeth): ?><tr><td colspan="7" class="soc-empty">No SurfaceTeeth found.</td></tr><?php endif; ?><?php foreach($surfaceteeth as $tooth): $ts=self::surfacetooth_status($tooth); $tp_id=self::surfacetooth_partner_id($tooth); $tp=$tp_id?get_user_by('id',$tp_id):false; $tp_store=$tp_id?(string)get_user_meta($tp_id,'surface_store',true):''; ?><tr><td><strong><?php echo esc_html($tooth->post_title); ?></strong></td><td><?php echo esc_html(self::surfacetooth_type($tooth)); ?></td><td><?php echo esc_html($tp_store ?: ($tp?$tp->display_name:'Unknown')); ?></td><td>/<?php echo esc_html(self::surfacetooth_sii($tooth) ?: '—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ts)); ?></span></td><td><?php echo esc_html(mysql2date('M j, Y',$tooth->post_date)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'surfaceteeth','view_surfacetooth'=>$tooth->ID],$base_url)); ?>">View</a><form method="post"><?php wp_nonce_field('surface_operations_surfacetooth','surface_operations_surfacetooth_nonce'); ?><input type="hidden" name="surfacetooth_id" value="<?php echo esc_attr($tooth->ID); ?>"><input type="hidden" name="surface_operations_surfacetooth_action" value="<?php echo esc_attr($ts==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $ts==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($ts==='suspended'?'Reactivate':'Suspend'); ?></button></form></div></td></tr><?php endforeach; ?></tbody></table></div></section>
         <?php elseif($section==='audit'): ?>
             <div class="soc-top"><div><h1>Audit Centre</h1><p>Review who did what, where and when across Surface Operations.</p></div></div>
             <section class="soc-panel">
