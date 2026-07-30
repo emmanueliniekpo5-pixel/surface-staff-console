@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.4.6.3
+ * Version: 1.4.8.3
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.4.6.3';
+    const VERSION = '1.4.8.3';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -27,6 +27,7 @@ final class Surface_Operations_Console {
         add_action('template_redirect', [__CLASS__, 'handle_front_auth'], 1);
         add_action('template_redirect', [__CLASS__, 'handle_analytics_export'], 4);
         add_action('template_redirect', [__CLASS__, 'handle_task_actions'], 5);
+        add_action('template_redirect', [__CLASS__, 'handle_registry_actions'], 5);
         add_action('template_redirect', [__CLASS__, 'handle_partner_actions'], 6);
         add_action('template_redirect', [__CLASS__, 'handle_surfacetooth_actions'], 7);
         add_action('template_redirect', [__CLASS__, 'handle_campaign_actions'], 8);
@@ -35,6 +36,7 @@ final class Surface_Operations_Console {
         add_action('template_redirect', [__CLASS__, 'handle_advocate_actions'], 11);
         add_action('template_redirect', [__CLASS__, 'handle_support_actions'], 12);
         add_action('template_redirect', [__CLASS__, 'handle_escalation_actions'], 13);
+        add_action('template_redirect', [__CLASS__, 'handle_notification_actions'], 14);
         add_filter('rest_request_after_callbacks', [__CLASS__, 'capture_resolve_request'], 10, 3);
         add_action('template_redirect', [__CLASS__, 'guard_staff_frontend'], 20);
 
@@ -232,6 +234,47 @@ final class Surface_Operations_Console {
         $wpdb->query("UPDATE {$escalations} SET current_level='team_lead' WHERE current_level='teamlead'");
         $wpdb->query("UPDATE {$escalations} SET current_level='operations_director' WHERE current_level='director'");
 
+
+        $notifications = $wpdb->prefix . 'surface_operations_notifications';
+        dbDelta("CREATE TABLE {$notifications} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id BIGINT UNSIGNED NOT NULL,
+            type_key VARCHAR(80) NOT NULL,
+            module VARCHAR(80) NOT NULL DEFAULT 'general',
+            priority VARCHAR(20) NOT NULL DEFAULT 'normal',
+            title VARCHAR(190) NOT NULL,
+            summary TEXT NULL,
+            object_type VARCHAR(80) NULL,
+            object_id VARCHAR(120) NULL,
+            target_url TEXT NULL,
+            is_read TINYINT(1) NOT NULL DEFAULT 0,
+            read_at DATETIME NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            KEY user_id_read (user_id, is_read),
+            KEY type_key (type_key),
+            KEY created_at (created_at)
+        ) {$charset};");
+
+
+        $registry_assignments = $wpdb->prefix . 'surface_operations_registry_assignments';
+        dbDelta("CREATE TABLE {$registry_assignments} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            registry_id BIGINT UNSIGNED NOT NULL,
+            assigned_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            assigned_team VARCHAR(80) NOT NULL DEFAULT 'Surface Identity',
+            priority VARCHAR(20) NOT NULL DEFAULT 'normal',
+            internal_notes LONGTEXT NULL,
+            assigned_by BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            assigned_at DATETIME NULL,
+            updated_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY registry_id (registry_id),
+            KEY assigned_user_id (assigned_user_id),
+            KEY assigned_team (assigned_team),
+            KEY priority (priority)
+        ) {$charset};");
+
         update_option('surface_operations_console_version', self::VERSION, false);
     }
 
@@ -374,14 +417,14 @@ final class Surface_Operations_Console {
 
     private static function role_permissions() {
         return [
-            'operations_director' => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','escalations','analytics','reports','teams','staff','audit'],
-            'operations_manager'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','escalations','analytics','reports','teams','staff'],
-            'team_lead'           => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','escalations','analytics','reports','teams'],
-            'operations_officer'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','resolver','support','escalations'],
-            'finance_officer'     => ['dashboard','tasks','wallet','bundles','escalations','reports'],
-            'compliance_officer'  => ['dashboard','tasks','partners','surfaceteeth','advocates','campaigns','resolver','escalations','audit'],
-            'support_officer'     => ['dashboard','tasks','partners','support','escalations'],
-            'auditor'             => ['dashboard','resolver','analytics','reports','audit'],
+            'operations_director' => ['dashboard','notifications','tasks','registry','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','escalations','analytics','reports','teams','staff','audit'],
+            'operations_manager'  => ['dashboard','notifications','tasks','registry','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','escalations','analytics','reports','teams','staff'],
+            'team_lead'           => ['dashboard','notifications','tasks','registry','partners','surfaceteeth','advocates','campaigns','wallet','bundles','resolver','support','escalations','analytics','reports','teams'],
+            'operations_officer'  => ['dashboard','notifications','tasks','registry','partners','surfaceteeth','advocates','campaigns','resolver','support','escalations'],
+            'finance_officer'     => ['dashboard','notifications','tasks','wallet','bundles','escalations','reports'],
+            'compliance_officer'  => ['dashboard','notifications','tasks','registry','partners','surfaceteeth','advocates','campaigns','resolver','escalations','audit'],
+            'support_officer'     => ['dashboard','notifications','tasks','partners','support','escalations'],
+            'auditor'             => ['dashboard','notifications','resolver','analytics','reports','audit'],
         ];
     }
 
@@ -668,7 +711,7 @@ final class Surface_Operations_Console {
                         <input type="hidden" name="surface_admin_task_action" value="create">
                         <p><label><strong>Task</strong><br><input class="widefat" name="task_title" required></label></p>
                         <p><label><strong>Description</strong><br><textarea class="widefat" rows="4" name="task_description"></textarea></label></p>
-                        <p><label><strong>Module</strong><br><select class="widefat" name="task_module"><?php foreach(['general'=>'General','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth','advocacy'=>'Advocacy','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','resolver'=>'Resolver','support'=>'Support'] as $k=>$v) echo '<option value="'.esc_attr($k).'">'.esc_html($v).'</option>'; ?></select></label></p>
+                        <p><label><strong>Module</strong><br><select class="widefat" name="task_module"><?php foreach(['general'=>'General','registry'=>'Surface Identity','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth','advocacy'=>'Advocacy','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','resolver'=>'Resolver','support'=>'Support'] as $k=>$v) echo '<option value="'.esc_attr($k).'">'.esc_html($v).'</option>'; ?></select></label></p>
                         <p><label><strong>Priority</strong><br><select class="widefat" name="task_priority"><option value="low">Low</option><option value="normal" selected>Normal</option><option value="high">High</option><option value="urgent">Urgent</option></select></label></p>
                         <p><label><strong>Assign to staff</strong><br><select class="widefat" name="task_user_id"><option value="0">Team queue</option><?php foreach($staff as $member){ if(self::staff_status($member->ID)==='suspended') continue; echo '<option value="'.esc_attr($member->ID).'">'.esc_html($member->display_name.' · '.self::user_team($member->ID)).'</option>'; } ?></select></label></p>
                         <p><label><strong>Team</strong><br><select class="widefat" name="task_team"><option value="">Select team</option><?php foreach(self::teams() as $team) echo '<option value="'.esc_attr($team).'">'.esc_html($team).'</option>'; ?></select></label></p>
@@ -1050,6 +1093,7 @@ final class Surface_Operations_Console {
                 if ($inserted !== false) {
                     $task_id = (int) $wpdb->insert_id;
                     self::audit('task.created','task',(string)$task_id,'Created task: ' . $title);
+                    if($assigned_user_id) self::notify_user($assigned_user_id,'task_assigned','tasks',$priority,'Task Assigned',$title,'task',$task_id,add_query_arg('soc_section','tasks',home_url('/'.self::CONSOLE_SLUG.'/')));
                     $redirect = add_query_arg('task_notice','created',$redirect);
                 } else {
                     $redirect = add_query_arg('task_notice','failed',$redirect);
@@ -1092,6 +1136,7 @@ final class Surface_Operations_Console {
                         'updated_at'=>current_time('mysql')
                     ],['id'=>$task_id],['%d','%s','%s'],['%d']);
                     self::audit('task.reassigned','task',(string)$task_id,'Reassigned task: '.$task->title);
+                    if($assigned_user_id) self::notify_user($assigned_user_id,'task_assigned','tasks',$task->priority,'Task Assigned',$task->title,'task',$task_id,add_query_arg('soc_section','tasks',home_url('/'.self::CONSOLE_SLUG.'/')));
                     $redirect = add_query_arg('task_notice','reassigned',$redirect);
                 }
                 if ($action === 'comment') {
@@ -1277,6 +1322,88 @@ final class Surface_Operations_Console {
         ));
     }
 
+    private static function ensure_notification_table() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'surface_operations_notifications';
+        if (self::table_exists($table)) return true;
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        $charset = $wpdb->get_charset_collate();
+        dbDelta("CREATE TABLE {$table} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id BIGINT UNSIGNED NOT NULL,
+            type_key VARCHAR(80) NOT NULL,
+            module VARCHAR(80) NOT NULL DEFAULT 'general',
+            priority VARCHAR(20) NOT NULL DEFAULT 'normal',
+            title VARCHAR(190) NOT NULL,
+            summary TEXT NULL,
+            object_type VARCHAR(80) NULL,
+            object_id VARCHAR(120) NULL,
+            target_url TEXT NULL,
+            is_read TINYINT(1) NOT NULL DEFAULT 0,
+            read_at DATETIME NULL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            KEY user_id_read (user_id, is_read),
+            KEY type_key (type_key),
+            KEY created_at (created_at)
+        ) {$charset};");
+        return self::table_exists($table);
+    }
+
+    private static function notification_recipients_for_level($level) {
+        $level = self::normalized_escalation_level($level);
+        $meta_level = ['manager'=>'operations_manager','team_lead'=>'team_lead','operations_director'=>'operations_director'][$level] ?? '';
+        if (!$meta_level) return [];
+        $users = get_users(['role'=>self::ROLE,'meta_key'=>'surface_operations_level','meta_value'=>$meta_level,'fields'=>'ID']);
+        return array_values(array_filter(array_map('absint',$users), function($id){ return self::staff_status($id) === 'active'; }));
+    }
+
+    private static function notify_user($user_id, $type_key, $module, $priority, $title, $summary, $object_type='', $object_id='', $target_url='') {
+        if (!$user_id || !self::ensure_notification_table()) return 0;
+        global $wpdb; $table=$wpdb->prefix.'surface_operations_notifications';
+        $wpdb->insert($table,['user_id'=>absint($user_id),'type_key'=>sanitize_key($type_key),'module'=>sanitize_key($module),'priority'=>sanitize_key($priority),'title'=>sanitize_text_field($title),'summary'=>sanitize_textarea_field($summary),'object_type'=>sanitize_key($object_type),'object_id'=>sanitize_text_field((string)$object_id),'target_url'=>esc_url_raw($target_url),'is_read'=>0,'created_at'=>current_time('mysql')],['%d','%s','%s','%s','%s','%s','%s','%s','%s','%d','%s']);
+        return (int)$wpdb->insert_id;
+    }
+
+    private static function notify_users($user_ids, $type_key, $module, $priority, $title, $summary, $object_type='', $object_id='', $target_url='') {
+        $ids=array_values(array_unique(array_filter(array_map('absint',(array)$user_ids))));
+        foreach($ids as $uid) self::notify_user($uid,$type_key,$module,$priority,$title,$summary,$object_type,$object_id,$target_url);
+        if($ids) self::audit('notification.generated',$object_type ?: 'notification',(string)$object_id,'Generated notification: '.$title,['type'=>$type_key,'recipients'=>$ids]);
+    }
+
+    private static function notification_count($user_id) {
+        if (!self::ensure_notification_table()) return 0;
+        global $wpdb; $table=$wpdb->prefix.'surface_operations_notifications';
+        return (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$table} WHERE user_id=%d AND is_read=0",$user_id));
+    }
+
+    private static function notifications_for_user($user_id,$limit=200) {
+        if (!self::ensure_notification_table()) return [];
+        global $wpdb; $table=$wpdb->prefix.'surface_operations_notifications';
+        return $wpdb->get_results($wpdb->prepare("SELECT * FROM {$table} WHERE user_id=%d ORDER BY is_read ASC, created_at DESC LIMIT %d",$user_id,$limit));
+    }
+
+    public static function handle_notification_actions() {
+        if (!is_user_logged_in() || !self::is_staff() || empty($_POST['surface_operations_notification_action'])) return;
+        check_admin_referer('surface_operations_notification','surface_operations_notification_nonce');
+        if (!self::ensure_notification_table()) return;
+        global $wpdb; $table=$wpdb->prefix.'surface_operations_notifications'; $uid=get_current_user_id();
+        $action=sanitize_key(wp_unslash($_POST['surface_operations_notification_action']));
+        $base=add_query_arg('soc_section','notifications',home_url('/'.self::CONSOLE_SLUG.'/'));
+        if($action==='mark_all_read'){
+            $wpdb->query($wpdb->prepare("UPDATE {$table} SET is_read=1,read_at=%s WHERE user_id=%d AND is_read=0",current_time('mysql'),$uid));
+            self::audit('notification.mark_all_read','notification',(string)$uid,'Marked all notifications as read');
+            wp_safe_redirect(add_query_arg('notification_notice','all_read',$base)); exit;
+        }
+        $nid=absint($_POST['notification_id']??0);
+        $row=$nid?$wpdb->get_row($wpdb->prepare("SELECT * FROM {$table} WHERE id=%d AND user_id=%d",$nid,$uid)):null;
+        if(!$row)return;
+        $wpdb->update($table,['is_read'=>1,'read_at'=>current_time('mysql')],['id'=>$nid],['%d','%s'],['%d']);
+        self::audit('notification.read','notification',(string)$nid,'Read notification: '.$row->title);
+        if($action==='open' && $row->target_url){wp_safe_redirect($row->target_url);exit;}
+        wp_safe_redirect(add_query_arg('notification_notice','read',$base));exit;
+    }
+
     private static function can_view_escalation($row, $user_id) {
         if (!$row) return false;
         if ((int)$row->created_by === (int)$user_id) return true;
@@ -1345,7 +1472,10 @@ final class Surface_Operations_Console {
         self::audit('escalation.created','escalation',(string)$id,'Created escalation '.$code.' for '.$object_label,[
             'object_type'=>$object_type,'object_id'=>(string)$object_id,'requested_action'=>$requested_action,'reason'=>$reason,'severity'=>$severity
         ]);
-        self::escalation_event($id, 'created', $notes, 'creator', self::next_escalation_level(get_current_user_id()));
+        $start_level=self::next_escalation_level(get_current_user_id());
+        self::escalation_event($id,'created',$notes,'creator',$start_level);
+        $target=add_query_arg(['soc_section'=>'escalations','view_escalation'=>$id],home_url('/'.self::CONSOLE_SLUG.'/'));
+        self::notify_users(self::notification_recipients_for_level($start_level),'escalation_submitted','escalations',$severity==='urgent'?'urgent':'high','New Escalation',$object_label.' requires '.self::escalation_owner_label($start_level).' review.','escalation',$id,$target);
         return $id;
     }
 
@@ -1392,6 +1522,8 @@ final class Surface_Operations_Console {
             $wpdb->update($table,['status'=>'pending','current_level'=>$new_level,'decision_notes'=>$notes,'updated_at'=>current_time('mysql')],['id'=>$eid],['%s','%s','%s','%s'],['%d']);
             self::escalation_event($eid,'resubmitted',$notes,'creator',$new_level);
             self::audit('escalation.resubmitted','escalation',(string)$eid,'Resubmitted escalation '.$row->case_code,['note'=>$notes,'to_level'=>$new_level]);
+            $target=add_query_arg(['soc_section'=>'escalations','view_escalation'=>$eid],$base);
+            self::notify_users(self::notification_recipients_for_level($new_level),'escalation_resubmitted','escalations','high','Escalation Resubmitted',$row->case_code.' has been resubmitted for review.','escalation',$eid,$target);
             $redirect_args['escalation_notice']='resubmitted';
             wp_safe_redirect(add_query_arg($redirect_args,$base)); exit;
         }
@@ -1418,6 +1550,10 @@ final class Surface_Operations_Console {
         $wpdb->update($table,$data,['id'=>$eid],$fmt,['%d']);
         self::escalation_event($eid,$event,$notes,$row->current_level,$new_level);
         self::audit('escalation.'.$event,'escalation',(string)$eid,ucfirst($event).' escalation '.$row->case_code.' from '.self::escalation_owner_label($row->current_level).' to '.self::escalation_owner_label($new_level),['decision_notes'=>$notes,'from_level'=>$row->current_level,'to_level'=>$new_level]);
+        $target=add_query_arg(['soc_section'=>'escalations','view_escalation'=>$eid],$base);
+        if($event==='forwarded') self::notify_users(self::notification_recipients_for_level($new_level),'escalation_forwarded','escalations','high','Escalation Forwarded',$row->case_code.' was forwarded to '.self::escalation_owner_label($new_level).'.','escalation',$eid,$target);
+        elseif($event==='returned'){ $recipients=$new_level==='creator'?[(int)$row->created_by]:self::notification_recipients_for_level($new_level); self::notify_users($recipients,'escalation_returned','escalations','high','Escalation Returned',$row->case_code.' was returned to '.self::escalation_owner_label($new_level).'.','escalation',$eid,$target);}
+        elseif(in_array($event,['approved','rejected'],true)) self::notify_users([(int)$row->created_by],'escalation_'.$event,'escalations',$event==='approved'?'normal':'high','Escalation '.ucfirst($event),$row->case_code.' has been '.$event.'.','escalation',$eid,$target);
         $redirect_args['escalation_notice']=$event;
         wp_safe_redirect(add_query_arg($redirect_args,$base)); exit;
     }
@@ -1435,6 +1571,7 @@ final class Surface_Operations_Console {
     }
 
     private static function escalation_form($type,$id,$label,$requested='suspend') {
+
         ob_start(); ?>
         <details class="soc-escalate"><summary class="soc-btn soc-btn-light">Escalate</summary><form class="soc-form" method="post" style="min-width:280px;margin-top:10px"><?php wp_nonce_field('surface_operations_escalation','surface_operations_escalation_nonce'); ?>
         <input type="hidden" name="surface_operations_escalation_action" value="create"><input type="hidden" name="object_type" value="<?php echo esc_attr($type); ?>"><input type="hidden" name="object_id" value="<?php echo esc_attr($id); ?>"><input type="hidden" name="object_label" value="<?php echo esc_attr($label); ?>"><input type="hidden" name="requested_action" value="<?php echo esc_attr($requested); ?>">
@@ -2399,6 +2536,218 @@ final class Surface_Operations_Console {
         fclose($out); exit;
     }
 
+
+    private static function registry_table_exists() {
+        global $wpdb;
+        return self::table_exists($wpdb->prefix . 'surface_identity_registry');
+    }
+
+    private static function registry_assignment_table() {
+        global $wpdb;
+        return $wpdb->prefix . 'surface_operations_registry_assignments';
+    }
+
+    /**
+     * The Registry queue must remain readable even when the plugin file was
+     * replaced without a deactivate/reactivate cycle. Create the lightweight
+     * operations-only assignment table on demand before it is joined.
+     */
+    private static function ensure_registry_assignment_table() {
+        global $wpdb;
+        $table = self::registry_assignment_table();
+        if (self::table_exists($table)) return true;
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        $charset = $wpdb->get_charset_collate();
+        dbDelta("CREATE TABLE {$table} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            registry_id BIGINT UNSIGNED NOT NULL,
+            assigned_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            assigned_team VARCHAR(80) NOT NULL DEFAULT 'Surface Identity',
+            priority VARCHAR(20) NOT NULL DEFAULT 'normal',
+            internal_notes LONGTEXT NULL,
+            assigned_by BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            assigned_at DATETIME NULL,
+            updated_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY registry_id (registry_id),
+            KEY assigned_user_id (assigned_user_id),
+            KEY assigned_team (assigned_team),
+            KEY priority (priority)
+        ) {$charset};");
+
+        return self::table_exists($table);
+    }
+
+    /**
+     * Bring identities created before the dedicated Registry flow into the
+     * canonical Registry table. Existing Registry rows are never overwritten.
+     */
+    private static function sync_legacy_partner_identities() {
+        global $wpdb;
+        if (!self::registry_table_exists()) return;
+
+        $registry = $wpdb->prefix . 'surface_identity_registry';
+        $users = get_users([
+            'meta_key' => 'surface_name',
+            'meta_compare' => 'EXISTS',
+            'number' => 5000,
+            'fields' => 'all',
+        ]);
+
+        foreach ($users as $user) {
+            $raw = (string) get_user_meta($user->ID, 'surface_name', true);
+            $identity = strtolower(trim($raw));
+            $identity = ltrim($identity, "/#@\\");
+            $identity = preg_replace('/[^a-z0-9]/', '', $identity);
+            if ($identity === '') continue;
+
+            $exists = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM {$registry} WHERE identity_normalized=%s LIMIT 1",
+                $identity
+            ));
+            if ($exists) continue;
+
+            $registered = !empty($user->user_registered) ? $user->user_registered : current_time('mysql');
+            $email = sanitize_email((string) get_user_meta($user->ID, 'surface_email', true));
+            if (!$email) $email = sanitize_email((string) $user->user_email);
+            $classification = ctype_digit($identity) && strlen($identity) === 3
+                ? 'premium_numeric_3'
+                : (ctype_digit($identity) && strlen($identity) === 4 ? 'premium_numeric_4' : 'regular');
+
+            $wpdb->insert($registry, [
+                'identity_name' => $identity,
+                'identity_normalized' => $identity,
+                'status' => 'active',
+                'owner_user_id' => (int) $user->ID,
+                'owner_email' => $email,
+                'order_id' => null,
+                'product_id' => null,
+                'registered_at' => $registered,
+                'starts_at' => $registered,
+                // Legacy ownership had no Registry expiry. Keep the required
+                // column populated without presenting it as a temporary hold.
+                'expires_at' => '2099-12-31 23:59:59',
+                'term_years' => 1,
+                'amount_paid' => null,
+                'currency' => 'NGN',
+                'created_source' => 'legacy_partner_profile',
+                'classification' => $classification,
+                'reservation_price' => null,
+                'reservation_email' => $email,
+                'reservation_token' => null,
+                'reservation_expires_at' => null,
+                'payment_reference' => null,
+                'paystack_id' => null,
+                'paid_at' => null,
+                'last_updated' => current_time('mysql'),
+            ]);
+        }
+    }
+
+    private static function registry_records($search = '', $status = '') {
+        global $wpdb;
+        if (!self::registry_table_exists()) return [];
+        self::sync_legacy_partner_identities();
+        $table = $wpdb->prefix . 'surface_identity_registry';
+        $has_assignments = self::ensure_registry_assignment_table();
+        $assign = self::registry_assignment_table();
+        $where = ['1=1']; $args = [];
+        if ($search !== '') {
+            $like = '%' . $wpdb->esc_like($search) . '%';
+            $where[] = '(r.identity_normalized LIKE %s OR r.owner_email LIKE %s OR r.reservation_email LIKE %s OR r.payment_reference LIKE %s)';
+            array_push($args,$like,$like,$like,$like);
+        }
+        if ($status !== '') { $where[]='r.status=%s'; $args[]=$status; }
+        if ($has_assignments) {
+            $sql = "SELECT r.*, a.assigned_user_id, a.assigned_team, a.priority, a.internal_notes, a.assigned_at
+                    FROM {$table} r LEFT JOIN {$assign} a ON a.registry_id=r.id
+                    WHERE ".implode(' AND ',$where)." ORDER BY r.last_updated DESC, r.id DESC LIMIT 300";
+        } else {
+            $sql = "SELECT r.*, 0 AS assigned_user_id, '' AS assigned_team, 'normal' AS priority, '' AS internal_notes, NULL AS assigned_at
+                    FROM {$table} r WHERE ".implode(' AND ',$where)." ORDER BY r.last_updated DESC, r.id DESC LIMIT 300";
+        }
+        if ($args) $sql=$wpdb->prepare($sql,$args);
+        return $wpdb->get_results($sql);
+    }
+
+    private static function registry_record($id) {
+        global $wpdb;
+        if (!self::registry_table_exists()) return null;
+        self::sync_legacy_partner_identities();
+        $table=$wpdb->prefix.'surface_identity_registry';
+        if (self::ensure_registry_assignment_table()) {
+            $assign=self::registry_assignment_table();
+            return $wpdb->get_row($wpdb->prepare("SELECT r.*, a.assigned_user_id, a.assigned_team, a.priority, a.internal_notes, a.assigned_at FROM {$table} r LEFT JOIN {$assign} a ON a.registry_id=r.id WHERE r.id=%d",$id));
+        }
+        return $wpdb->get_row($wpdb->prepare("SELECT r.*, 0 AS assigned_user_id, '' AS assigned_team, 'normal' AS priority, '' AS internal_notes, NULL AS assigned_at FROM {$table} r WHERE r.id=%d",$id));
+    }
+
+    private static function registry_status_label($status) {
+        if (class_exists('Surface_Identity_Registry')) return Surface_Identity_Registry::status_label($status);
+        return ucwords(str_replace('_',' ',sanitize_key($status)));
+    }
+
+    private static function registry_class_label($classification) {
+        if (class_exists('Surface_Identity_Registry')) return Surface_Identity_Registry::classification_label_from_key($classification);
+        return ucwords(str_replace('_',' ',sanitize_key($classification)));
+    }
+
+    private static function registry_can_transition($from,$to) {
+        return class_exists('Surface_Identity_Registry') && Surface_Identity_Registry::can_transition($from,$to);
+    }
+
+    public static function handle_registry_actions() {
+        if (!is_user_logged_in() || !self::is_staff() || !self::can_access('registry',get_current_user_id())) return;
+        if (empty($_POST['surface_operations_registry_action'])) return;
+        check_admin_referer('surface_operations_registry','surface_operations_registry_nonce');
+        global $wpdb;
+        $action=sanitize_key(wp_unslash($_POST['surface_operations_registry_action']));
+        $record_id=absint($_POST['registry_id']??0);
+        $record=self::registry_record($record_id);
+        if (!$record) return;
+        $base=home_url('/'.self::CONSOLE_SLUG.'/');
+        $redirect=add_query_arg(['soc_section'=>'registry','view_registry'=>$record_id],$base);
+
+        if ($action==='assign') {
+            $assigned_user=absint($_POST['assigned_user_id']??0);
+            $priority=sanitize_key(wp_unslash($_POST['registry_priority']??'normal'));
+            if(!in_array($priority,['low','normal','high','urgent'],true))$priority='normal';
+            $notes=sanitize_textarea_field(wp_unslash($_POST['registry_notes']??''));
+            $team='Surface Identity';
+            $table=self::registry_assignment_table();
+            $now=current_time('mysql');
+            $wpdb->replace($table,[
+                'registry_id'=>$record_id,'assigned_user_id'=>$assigned_user,'assigned_team'=>$team,
+                'priority'=>$priority,'internal_notes'=>$notes,'assigned_by'=>get_current_user_id(),
+                'assigned_at'=>$assigned_user?$now:null,'updated_at'=>$now
+            ],['%d','%d','%s','%s','%s','%d','%s','%s']);
+            self::audit('registry.assigned','registry',(string)$record_id,'Assigned /'.$record->identity_normalized.' for identity review',['assigned_user_id'=>$assigned_user,'priority'=>$priority]);
+            if($assigned_user){
+                self::notify_user($assigned_user,'registry_assignment','registry',$priority,'Surface Identity assigned','/'.$record->identity_normalized.' requires review.','registry',(string)$record_id,add_query_arg(['soc_section'=>'registry','view_registry'=>$record_id],$base));
+            }
+            $redirect=add_query_arg('registry_notice','assigned',$redirect);
+        } elseif ($action==='transition') {
+            if (!self::can_enforce(get_current_user_id())) {
+                self::audit('registry.transition_denied','registry',(string)$record_id,'Blocked unauthorized Registry lifecycle action for /'.$record->identity_normalized);
+                $redirect=add_query_arg('registry_notice','permission_denied',$redirect);
+                wp_safe_redirect($redirect); exit;
+            }
+            $to=sanitize_key(wp_unslash($_POST['registry_status']??''));
+            if (!class_exists('Surface_Identity_Registry')) {
+                $redirect=add_query_arg('registry_notice','registry_unavailable',$redirect);
+            } else {
+                $result=Surface_Identity_Registry::transition_status($record_id,$to);
+                if(is_wp_error($result)) $redirect=add_query_arg('registry_error',rawurlencode($result->get_error_message()),$redirect);
+                else {
+                    self::audit('registry.status_changed','registry',(string)$record_id,'Changed /'.$record->identity_normalized.' from '.self::registry_status_label($record->status).' to '.self::registry_status_label($to),['from'=>$record->status,'to'=>$to]);
+                    $redirect=add_query_arg('registry_notice','status_updated',$redirect);
+                }
+            }
+        }
+        wp_safe_redirect($redirect); exit;
+    }
+
     public static function render_console() {
         if (!is_user_logged_in() || !self::is_staff()) {
             return '<script>window.location.href=' . wp_json_encode(home_url('/' . self::LOGIN_SLUG . '/')) . ';</script>';
@@ -2409,6 +2758,15 @@ final class Surface_Operations_Console {
         $level = self::level_label(self::user_level($user->ID));
         $section = sanitize_key(wp_unslash($_GET['soc_section'] ?? 'dashboard'));
         if (!self::can_access($section, $user->ID)) $section = 'dashboard';
+        $registry_search=sanitize_text_field(wp_unslash($_GET['registry_search']??''));
+        $registry_status=sanitize_key(wp_unslash($_GET['registry_status']??''));
+        $registry_records=$section==='registry'?self::registry_records($registry_search,$registry_status):[];
+        $registry_notice=sanitize_key(wp_unslash($_GET['registry_notice']??''));
+        $registry_error=sanitize_text_field(wp_unslash($_GET['registry_error']??''));
+        $view_registry_id=absint($_GET['view_registry']??0);
+        $view_registry=($section==='registry'&&$view_registry_id)?self::registry_record($view_registry_id):null;
+        if($view_registry) self::audit('registry.viewed','registry',(string)$view_registry_id,'Viewed Surface Identity /'.$view_registry->identity_normalized,['status'=>$view_registry->status]);
+
         $task_counts = self::task_counts($user->ID, $team);
         $all_staff_ids = get_users(['role'=>self::ROLE,'fields'=>'ID']);
         $active_staff=0; $suspended_staff=0;
@@ -2417,6 +2775,9 @@ final class Surface_Operations_Console {
         $recent_audit = self::recent_audit(6);
         $logout_url = wp_logout_url(home_url('/'.self::LOGIN_SLUG.'/'));
         $base_url = home_url('/'.self::CONSOLE_SLUG.'/');
+        $notification_count=self::notification_count($user->ID);
+        $notifications=$section==='notifications'?self::notifications_for_user($user->ID):[];
+        $notification_notice=sanitize_key(wp_unslash($_GET['notification_notice']??''));
         $staff_list = get_users(['role'=>self::ROLE,'orderby'=>'display_name','order'=>'ASC']);
         $task_notice = sanitize_key(wp_unslash($_GET['task_notice'] ?? ''));
         $task_filters = [
@@ -2562,16 +2923,64 @@ final class Surface_Operations_Console {
         body{background:#f4f6f8!important}.soc-app{min-height:100vh;display:grid;grid-template-columns:250px 1fr;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827}.soc-sidebar{background:#111827;color:#fff;padding:26px 18px;position:sticky;top:0;height:100vh;box-sizing:border-box;display:flex;flex-direction:column;overflow:hidden}.soc-brand{font-size:19px;font-weight:800;padding:0 10px 24px}.soc-brand small{display:block;color:#9ca3af;font-size:11px;font-weight:600;margin-top:4px}.soc-nav{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}.soc-nav a{display:block;color:#cbd5e1;text-decoration:none;padding:11px 12px;border-radius:10px;margin:3px 0;font-size:14px}.soc-nav a:hover,.soc-nav a.active{background:#1f2937;color:#fff}.soc-sidebar-foot{position:static;flex:0 0 auto;border-top:1px solid #374151;padding-top:16px;margin-top:14px}.soc-sidebar-foot strong,.soc-sidebar-foot span{display:block}.soc-sidebar-foot span{font-size:12px;color:#9ca3af;margin:3px 0 10px}.soc-sidebar-foot a{color:#cbd5e1;font-size:13px}.soc-main{padding:30px}.soc-top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:25px}.soc-top h1{font-size:29px;margin:0 0 4px}.soc-top p{margin:0;color:#6b7280}.soc-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.soc-stat,.soc-panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px}.soc-stat{padding:20px}.soc-stat span{display:block;color:#6b7280;font-size:13px}.soc-stat strong{display:block;font-size:30px;margin-top:7px}.soc-columns{display:grid;grid-template-columns:1.25fr .9fr;gap:18px;margin-top:18px}.soc-panel{padding:21px}.soc-panel h2{font-size:17px;margin:0 0 16px}.soc-row{display:flex;justify-content:space-between;gap:14px;padding:13px 0;border-top:1px solid #f0f1f3}.soc-row:first-of-type{border-top:0}.soc-row-title{font-weight:700;font-size:14px}.soc-meta{font-size:12px;color:#6b7280;margin-top:4px}.soc-badge{height:max-content;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:750;background:#f3f4f6}.soc-empty{color:#6b7280;font-size:14px;padding:8px 0}.soc-task-grid{display:grid;grid-template-columns:340px 1fr;gap:18px}.soc-form label{display:block;font-size:12px;font-weight:700;margin:0 0 6px}.soc-form input,.soc-form select,.soc-form textarea{width:100%;box-sizing:border-box;padding:11px;border:1px solid #d1d5db;border-radius:10px;margin:0 0 13px;background:#fff}.soc-form textarea{min-height:90px;resize:vertical}.soc-btn{border:0;border-radius:10px;background:#111827;color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}.soc-btn-light{background:#eef0f3;color:#111827}.soc-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.soc-task{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-task-head{display:flex;justify-content:space-between;gap:12px}.soc-task h3{font-size:15px;margin:0}.soc-task p{font-size:13px;color:#4b5563}.soc-inline{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.soc-inline select,.soc-inline input{margin:0}.soc-alert{padding:12px 14px;border-radius:10px;background:#ecfdf5;color:#065f46;margin-bottom:16px}.soc-comments{margin-top:13px;padding-top:12px;border-top:1px solid #eef0f2}.soc-comment{font-size:12px;padding:7px 0}.soc-comment b{display:block}.soc-overdue{color:#b91c1c;font-weight:700}.soc-filters{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:14px;padding:12px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px}.soc-filters label{font-size:12px;font-weight:700}.soc-filters select{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-filters input{display:block;margin-top:5px;padding:8px;border:1px solid #d1d5db;border-radius:8px;background:#fff}.soc-audit-item{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin-bottom:12px}.soc-audit-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.soc-audit-summary{font-weight:750;font-size:14px}.soc-audit-details{margin-top:12px;padding-top:12px;border-top:1px solid #eef0f2;font-size:12px;color:#4b5563}.soc-audit-details code{display:block;white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:10px;border-radius:8px;margin-top:8px}.soc-audit-count{font-size:13px;color:#6b7280;margin-bottom:12px}.soc-table-wrap{overflow-x:auto}.soc-table{width:100%;border-collapse:collapse}.soc-table th,.soc-table td{text-align:left;padding:13px 10px;border-bottom:1px solid #e5e7eb;font-size:13px;vertical-align:middle}.soc-table th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#6b7280}.soc-partner-profile{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.soc-profile-field{padding:14px;background:#f8fafc;border-radius:12px}.soc-profile-field span{display:block;color:#6b7280;font-size:11px;text-transform:uppercase}.soc-profile-field strong{display:block;margin-top:5px;font-size:14px}.soc-timeline{border-left:2px solid #e5e7eb;margin-left:8px;padding-left:18px}.soc-timeline-item{margin:0 0 16px}.soc-note{background:#f8fafc;border-radius:12px;padding:13px;margin-bottom:10px}@media(max-width:900px){.soc-app{grid-template-columns:1fr}.soc-sidebar{height:auto;position:relative;overflow:visible}.soc-nav{overflow:visible;padding-right:0}.soc-sidebar-foot{position:static;margin-top:20px}.soc-main{padding:20px}.soc-grid{grid-template-columns:repeat(2,1fr)}.soc-columns,.soc-task-grid{grid-template-columns:1fr}}@media(max-width:520px){.soc-grid{grid-template-columns:1fr}}
         </style>
         <div class="soc-app"><aside class="soc-sidebar"><div class="soc-brand">Surface Operations<small>Operating the Surface Internet</small></div><nav class="soc-nav">
-        <?php $nav=['dashboard'=>'Dashboard','tasks'=>'Tasks','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth™','advocates'=>'Advocates','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','resolver'=>'Resolver','support'=>'Support','escalations'=>'Escalations','analytics'=>'Analytics','reports'=>'Reports','teams'=>'Teams','staff'=>'Staff','audit'=>'Audit']; foreach($nav as $key=>$label){if(!self::can_access($key,$user->ID))continue;$url=add_query_arg('soc_section',$key,$base_url);echo '<a class="'.($key===$section?'active':'').'" href="'.esc_url($url).'">'.esc_html($label).'</a>';} ?>
+        <?php $nav=['dashboard'=>'Dashboard','notifications'=>'Notifications','tasks'=>'Tasks','registry'=>'Surface Identity','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth™','advocates'=>'Advocates','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','resolver'=>'Resolver','support'=>'Support','escalations'=>'Escalations','analytics'=>'Analytics','reports'=>'Reports','teams'=>'Teams','staff'=>'Staff','audit'=>'Audit']; foreach($nav as $key=>$label){if(!self::can_access($key,$user->ID))continue;$url=add_query_arg('soc_section',$key,$base_url);$nav_label=$label.(($key==='notifications'&&$notification_count)?' ('.$notification_count.')':'');echo '<a class="'.($key===$section?'active':'').'" href="'.esc_url($url).'">'.esc_html($nav_label).'</a>';} ?>
         </nav><div class="soc-sidebar-foot"><strong><?php echo esc_html($user->display_name); ?></strong><span><?php echo esc_html($level.' · '.$team); ?></span><a href="<?php echo esc_url($logout_url); ?>">Sign out</a></div></aside><main class="soc-main">
-        <?php if($section==='tasks'): ?>
+        <?php if($section==='notifications'): ?>
+            <div class="soc-top"><div><h1>Notifications</h1><p>Operational updates requiring your attention.</p></div><?php if($notification_count): ?><form method="post"><?php wp_nonce_field('surface_operations_notification','surface_operations_notification_nonce'); ?><input type="hidden" name="surface_operations_notification_action" value="mark_all_read"><button class="soc-btn soc-btn-light">Mark All Read</button></form><?php endif; ?></div>
+            <?php if($notification_notice): ?><div class="soc-alert">Notification status updated.</div><?php endif; ?>
+            <section class="soc-grid" style="grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:18px"><div class="soc-stat"><span>Unread</span><strong><?php echo esc_html($notification_count); ?></strong></div><div class="soc-stat"><span>Total</span><strong><?php echo esc_html(count($notifications)); ?></strong></div></section>
+            <section class="soc-panel"><h2>Notification Centre</h2><?php if(!$notifications): ?><div class="soc-empty">No notifications yet.</div><?php endif; ?><?php foreach($notifications as $notification): ?><article class="soc-task" style="<?php echo !$notification->is_read?'border-left:4px solid #111827;':''; ?>"><div class="soc-task-head"><div><h3><?php echo esc_html($notification->title); ?></h3><div class="soc-meta"><?php echo esc_html(ucfirst($notification->module).' · '.ucfirst($notification->priority).' · '.mysql2date('M j, Y g:i a',$notification->created_at)); ?></div></div><span class="soc-badge"><?php echo $notification->is_read?'Read':'Unread'; ?></span></div><p><?php echo esc_html($notification->summary); ?></p><div class="soc-actions"><form method="post"><?php wp_nonce_field('surface_operations_notification','surface_operations_notification_nonce'); ?><input type="hidden" name="notification_id" value="<?php echo esc_attr($notification->id); ?>"><input type="hidden" name="surface_operations_notification_action" value="<?php echo $notification->target_url?'open':'read'; ?>"><button class="soc-btn <?php echo $notification->is_read?'soc-btn-light':''; ?>"><?php echo $notification->target_url?'Open':'Mark as Read'; ?></button></form><?php if(!$notification->is_read&&$notification->target_url): ?><form method="post"><?php wp_nonce_field('surface_operations_notification','surface_operations_notification_nonce'); ?><input type="hidden" name="notification_id" value="<?php echo esc_attr($notification->id); ?>"><input type="hidden" name="surface_operations_notification_action" value="read"><button class="soc-btn soc-btn-light">Mark as Read</button></form><?php endif; ?></div></article><?php endforeach; ?></section>
+        <?php elseif($section==='tasks'): ?>
             <div class="soc-top"><div><h1>Tasks</h1><p>Assign, claim and complete operational work.</p></div></div>
             <?php if($task_notice): ?><div class="soc-alert">Task action completed.</div><?php endif; ?>
             <section class="soc-grid" style="margin-bottom:18px"><div class="soc-stat"><span>My Open Tasks</span><strong><?php echo esc_html($task_counts['mine']); ?></strong></div><div class="soc-stat"><span>Team Queue</span><strong><?php echo esc_html($task_counts['team']); ?></strong></div><div class="soc-stat"><span>Due Today</span><strong><?php echo esc_html($task_counts['due_today']); ?></strong></div><div class="soc-stat"><span>Overdue</span><strong><?php echo esc_html($task_counts['overdue']); ?></strong></div></section>
             <section class="soc-task-grid">
-                <?php if(self::can_manage_tasks($user->ID)): ?><div class="soc-panel"><h2>Assign Task</h2><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="create"><label>Task</label><input name="task_title" required><label>Description</label><textarea name="task_description"></textarea><label>Module</label><select name="task_module"><?php foreach(['general'=>'General','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth','advocacy'=>'Advocacy','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','support'=>'Support'] as $k=>$v)echo '<option value="'.esc_attr($k).'">'.esc_html($v).'</option>'; ?></select><label>Priority</label><select name="task_priority"><option value="low">Low</option><option value="normal" selected>Normal</option><option value="high">High</option><option value="urgent">Urgent</option></select><label>Assign to staff</label><select name="task_user_id"><option value="0">Team queue</option><?php foreach($staff_list as $member){if(self::staff_status($member->ID)==='suspended')continue;echo '<option value="'.esc_attr($member->ID).'">'.esc_html($member->display_name.' · '.self::user_team($member->ID)).'</option>';} ?></select><label>Team</label><select name="task_team"><option value="">Select team</option><?php foreach(self::teams() as $t)echo '<option value="'.esc_attr($t).'">'.esc_html($t).'</option>'; ?></select><label>Due date</label><input type="datetime-local" name="task_due_at"><button class="soc-btn" type="submit">Assign Task</button></form></div><?php endif; ?>
+                <?php if(self::can_manage_tasks($user->ID)): ?><div class="soc-panel"><h2>Assign Task</h2><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="create"><label>Task</label><input name="task_title" required><label>Description</label><textarea name="task_description"></textarea><label>Module</label><select name="task_module"><?php foreach(['general'=>'General','registry'=>'Surface Identity','partners'=>'Partners','surfaceteeth'=>'SurfaceTeeth','advocacy'=>'Advocacy','campaigns'=>'Campaigns','wallet'=>'Wallet','bundles'=>'Bundles','support'=>'Support'] as $k=>$v)echo '<option value="'.esc_attr($k).'">'.esc_html($v).'</option>'; ?></select><label>Priority</label><select name="task_priority"><option value="low">Low</option><option value="normal" selected>Normal</option><option value="high">High</option><option value="urgent">Urgent</option></select><label>Assign to staff</label><select name="task_user_id"><option value="0">Team queue</option><?php foreach($staff_list as $member){if(self::staff_status($member->ID)==='suspended')continue;echo '<option value="'.esc_attr($member->ID).'">'.esc_html($member->display_name.' · '.self::user_team($member->ID)).'</option>';} ?></select><label>Team</label><select name="task_team"><option value="">Select team</option><?php foreach(self::teams() as $t)echo '<option value="'.esc_attr($t).'">'.esc_html($t).'</option>'; ?></select><label>Due date</label><input type="datetime-local" name="task_due_at"><button class="soc-btn" type="submit">Assign Task</button></form></div><?php endif; ?>
                 <div class="soc-panel"><h2><?php echo self::can_manage_tasks($user->ID)?'Operational Tasks':'My Tasks'; ?></h2><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="tasks"><label>Status<select name="task_status"><option value="all">All</option><option value="open" <?php selected($task_filters['status'],'open'); ?>>Open</option><option value="in_progress" <?php selected($task_filters['status'],'in_progress'); ?>>In Progress</option><option value="completed" <?php selected($task_filters['status'],'completed'); ?>>Completed</option></select></label><label>Priority<select name="task_priority"><option value="all">All</option><?php foreach(['low'=>'Low','normal'=>'Normal','high'=>'High','urgent'=>'Urgent'] as $k=>$v)echo '<option value="'.esc_attr($k).'" '.selected($task_filters['priority'],$k,false).'>'.esc_html($v).'</option>'; ?></select></label><?php if(self::can_manage_tasks($user->ID)): ?><label>Team<select name="task_team"><option value="">All teams</option><?php foreach(self::teams() as $t)echo '<option value="'.esc_attr($t).'" '.selected($task_filters['team'],$t,false).'>'.esc_html($t).'</option>'; ?></select></label><label>Staff<select name="task_user_id"><option value="0">All staff</option><?php foreach($staff_list as $member)echo '<option value="'.esc_attr($member->ID).'" '.selected($task_filters['user_id'],$member->ID,false).'>'.esc_html($member->display_name).'</option>'; ?></select></label><?php endif; ?><button class="soc-btn soc-btn-light" type="submit">Filter</button><a class="soc-btn soc-btn-light" style="text-decoration:none" href="<?php echo esc_url(add_query_arg('soc_section','tasks',$base_url)); ?>">Reset</a></form><?php $tasks=self::visible_tasks($user->ID,$team,self::can_manage_tasks($user->ID),$task_filters); if(!$tasks): ?><div class="soc-empty">No tasks found.</div><?php endif; ?><?php foreach($tasks as $task): $comments=self::task_comments($task->id); ?><article class="soc-task"><div class="soc-task-head"><div><h3><?php echo esc_html($task->title); ?></h3><div class="soc-meta"><?php echo esc_html(ucfirst($task->module).' · '.ucwords(str_replace('_',' ',$task->status)).' · '.ucfirst($task->priority)); ?><?php if($task->due_at): ?> · <span class="<?php echo ($task->status!=='completed' && strtotime($task->due_at)<current_time('timestamp'))?'soc-overdue':''; ?>">Due <?php echo esc_html(mysql2date('M j, g:i a',$task->due_at)); ?></span><?php endif; ?></div></div><span class="soc-badge"><?php echo esc_html($task->assigned_user_id?self::staff_name($task->assigned_user_id):($task->assigned_team?:'Unassigned')); ?></span></div><?php if($task->description): ?><p><?php echo nl2br(esc_html($task->description)); ?></p><?php endif; ?><div class="soc-actions"><?php if(self::can_manage_tasks($user->ID)): ?><form class="soc-inline" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="reassign"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><select name="task_user_id"><option value="0">Team queue</option><?php foreach($staff_list as $member){if(self::staff_status($member->ID)==='suspended')continue;echo '<option value="'.esc_attr($member->ID).'" '.selected((int)$task->assigned_user_id,$member->ID,false).'>'.esc_html($member->display_name).'</option>';} ?></select><select name="task_team"><option value="">No team</option><?php foreach(self::teams() as $t)echo '<option value="'.esc_attr($t).'" '.selected((string)$task->assigned_team,$t,false).'>'.esc_html($t).'</option>'; ?></select><button class="soc-btn soc-btn-light" type="submit">Reassign</button></form><?php endif; ?><?php if(!$task->assigned_user_id && $task->assigned_team===$team): ?><form method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="claim"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><button class="soc-btn" type="submit">Claim</button></form><?php endif; ?><form class="soc-inline" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="status"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><select name="task_status"><option value="open" <?php selected($task->status,'open'); ?>>Open</option><option value="in_progress" <?php selected($task->status,'in_progress'); ?>>In Progress</option><option value="completed" <?php selected($task->status,'completed'); ?>>Completed</option></select><button class="soc-btn soc-btn-light" type="submit">Update</button></form></div><div class="soc-comments"><?php foreach($comments as $comment): ?><div class="soc-comment"><b><?php echo esc_html(self::staff_name($comment->user_id)); ?></b><?php echo esc_html($comment->comment_text); ?> <span class="soc-meta"><?php echo esc_html(mysql2date('M j, g:i a',$comment->created_at)); ?></span></div><?php endforeach; ?><form class="soc-inline" method="post"><?php wp_nonce_field('surface_operations_task','surface_operations_task_nonce'); ?><input type="hidden" name="surface_operations_task_action" value="comment"><input type="hidden" name="task_id" value="<?php echo esc_attr($task->id); ?>"><input type="text" name="task_comment" placeholder="Add internal comment" required><button class="soc-btn soc-btn-light" type="submit">Comment</button></form></div></article><?php endforeach; ?></div>
             </section>
+
+        <?php elseif($section==='registry'): ?>
+            <?php
+            $registry_counts=['total'=>0,'pending'=>0,'active'=>0,'attention'=>0];
+            foreach(self::registry_records('','') as $rr){$registry_counts['total']++; if($rr->status==='active')$registry_counts['active']++; if(in_array($rr->status,['reserved_pending_payment','payment_confirmed','pending_otp','pending_verification'],true))$registry_counts['pending']++; if(in_array($rr->status,['pending_verification','suspended'],true))$registry_counts['attention']++;}
+            ?>
+            <div class="soc-top"><div><h1>Surface Identity</h1><p>Assign and process Surface Internet Identity cases from the Registry.</p></div></div>
+            <?php if($registry_notice==='assigned'): ?><div class="soc-alert">Registry case assigned successfully.</div><?php elseif($registry_notice==='status_updated'): ?><div class="soc-alert">Registry lifecycle status updated.</div><?php elseif($registry_notice==='permission_denied'): ?><div class="soc-alert">Only the Operations Director can change a Registry lifecycle status. Other staff should review, assign, add notes, or escalate the case.</div><?php endif; ?>
+            <?php if($registry_error): ?><div class="soc-alert" style="background:#fef2f2;color:#991b1b"><?php echo esc_html($registry_error); ?></div><?php endif; ?>
+            <?php if(!self::registry_table_exists()): ?><section class="soc-panel"><div class="soc-empty">The Surface Identity Registry plugin or table is not available.</div></section>
+            <?php else: ?>
+            <section class="soc-grid" style="margin-bottom:18px"><div class="soc-stat"><span>Total Identities</span><strong><?php echo esc_html($registry_counts['total']); ?></strong></div><div class="soc-stat"><span>In Progress</span><strong><?php echo esc_html($registry_counts['pending']); ?></strong></div><div class="soc-stat"><span>Active</span><strong><?php echo esc_html($registry_counts['active']); ?></strong></div><div class="soc-stat"><span>Needs Attention</span><strong><?php echo esc_html($registry_counts['attention']); ?></strong></div></section>
+            <?php if($view_registry):
+                $owner=$view_registry->owner_user_id?get_user_by('id',(int)$view_registry->owner_user_id):false;
+                $owner_phone=$owner?(string)get_user_meta($owner->ID,'surface_phone',true):'';
+                $assigned=$view_registry->assigned_user_id?get_user_by('id',(int)$view_registry->assigned_user_id):false;
+                $display_email=$view_registry->owner_email ?: $view_registry->reservation_email;
+            ?>
+            <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">/<?php echo esc_html($view_registry->identity_normalized); ?></h2><p>Surface Internet Identity case details.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','registry',$base_url)); ?>">Back to Registry</a></div>
+            <div class="soc-partner-profile">
+              <div class="soc-profile-field"><span>Identity</span><strong>/<?php echo esc_html($view_registry->identity_normalized); ?></strong></div>
+              <div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(self::registry_status_label($view_registry->status)); ?></strong></div>
+              <div class="soc-profile-field"><span>Classification</span><strong><?php echo esc_html(self::registry_class_label($view_registry->classification)); ?></strong></div>
+              <div class="soc-profile-field"><span>Applicant</span><strong><?php echo esc_html($owner?$owner->display_name:'Not yet linked'); ?></strong></div>
+              <div class="soc-profile-field"><span>Email</span><strong><?php echo esc_html($display_email ?: 'Not available'); ?></strong></div>
+              <div class="soc-profile-field"><span>Phone</span><strong><?php echo esc_html($owner_phone ?: 'Not available'); ?></strong></div>
+              <div class="soc-profile-field"><span>Payment</span><strong><?php echo $view_registry->amount_paid!==null ? esc_html(($view_registry->currency?:'NGN').' '.number_format_i18n((float)$view_registry->amount_paid,2)) : 'Not confirmed'; ?></strong></div>
+              <div class="soc-profile-field"><span>Payment Reference</span><strong><?php echo esc_html($view_registry->payment_reference ?: 'Not available'); ?></strong></div>
+              <div class="soc-profile-field"><span>Reservation Source</span><strong><?php echo esc_html(ucwords(str_replace('_',' ',$view_registry->created_source))); ?></strong></div>
+              <div class="soc-profile-field"><span>Registered</span><strong><?php echo esc_html($view_registry->registered_at?mysql2date('M j, Y g:i a',$view_registry->registered_at):'Not available'); ?></strong></div>
+              <div class="soc-profile-field"><span>Reservation Expires</span><strong><?php echo esc_html($view_registry->reservation_expires_at?mysql2date('M j, Y g:i a',$view_registry->reservation_expires_at):'Not applicable'); ?></strong></div>
+              <div class="soc-profile-field"><span>Last Updated</span><strong><?php echo esc_html($view_registry->last_updated?mysql2date('M j, Y g:i a',$view_registry->last_updated):'Not available'); ?></strong></div>
+              <div class="soc-profile-field"><span>Assigned Staff</span><strong><?php echo esc_html($assigned?$assigned->display_name:'Unassigned'); ?></strong></div>
+              <div class="soc-profile-field"><span>Priority</span><strong><?php echo esc_html(ucfirst($view_registry->priority ?: 'normal')); ?></strong></div>
+              <?php if($view_registry->internal_notes): ?><div class="soc-profile-field" style="grid-column:1/-1"><span>Internal Notes</span><strong><?php echo nl2br(esc_html($view_registry->internal_notes)); ?></strong></div><?php endif; ?>
+            </div></section>
+            <section class="soc-columns" style="margin-top:0;margin-bottom:18px">
+              <div class="soc-panel"><h2>Assignment</h2><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_registry','surface_operations_registry_nonce'); ?><input type="hidden" name="surface_operations_registry_action" value="assign"><input type="hidden" name="registry_id" value="<?php echo esc_attr($view_registry->id); ?>"><label>Assign to staff<select name="assigned_user_id"><option value="0">Surface Identity team queue</option><?php foreach($staff_list as $member){if(self::staff_status($member->ID)==='suspended')continue;echo '<option value="'.esc_attr($member->ID).'" '.selected((int)$view_registry->assigned_user_id,$member->ID,false).'>'.esc_html($member->display_name.' · '.self::user_team($member->ID)).'</option>';} ?></select></label><label>Priority<select name="registry_priority"><?php foreach(['low'=>'Low','normal'=>'Normal','high'=>'High','urgent'=>'Urgent'] as $k=>$v)echo '<option value="'.esc_attr($k).'" '.selected((string)$view_registry->priority,$k,false).'>'.esc_html($v).'</option>'; ?></select></label><label>Internal notes<textarea name="registry_notes"><?php echo esc_textarea($view_registry->internal_notes); ?></textarea></label><button class="soc-btn" type="submit">Save Assignment</button></form></div>
+              <div class="soc-panel"><h2>Lifecycle Actions</h2><?php if(self::can_enforce($user->ID)): ?><p class="soc-meta">Only transitions permitted by the Registry lifecycle are shown.</p><div class="soc-actions"><?php foreach(['active'=>'Approve / Activate','rejected'=>'Reject','suspended'=>'Suspend','expired'=>'Expire'] as $target=>$label){if(!self::registry_can_transition($view_registry->status,$target))continue; if($target==='active' && $view_registry->status==='suspended')$label='Reactivate'; ?><form method="post"><?php wp_nonce_field('surface_operations_registry','surface_operations_registry_nonce'); ?><input type="hidden" name="surface_operations_registry_action" value="transition"><input type="hidden" name="registry_id" value="<?php echo esc_attr($view_registry->id); ?>"><input type="hidden" name="registry_status" value="<?php echo esc_attr($target); ?>"><button class="soc-btn <?php echo $target==='active'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($label); ?></button></form><?php } ?></div><?php else: ?><p class="soc-meta">Lifecycle decisions are restricted to the Operations Director. You may review the case, update its assignment and notes, or escalate it through the existing workflow.</p><?php endif; ?></div>
+            </section>
+            <?php endif; ?>
+            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="registry"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="registry_search" value="<?php echo esc_attr($registry_search); ?>" placeholder="Search identity, email or payment reference"></label><label>Status<select name="registry_status"><option value="">All statuses</option><?php $statuses=class_exists('Surface_Identity_Registry')?Surface_Identity_Registry::get_statuses():[]; foreach($statuses as $k=>$v){if($k==='available')continue;echo '<option value="'.esc_attr($k).'" '.selected($registry_status,$k,false).'>'.esc_html($v).'</option>';} ?></select></label><button class="soc-btn" type="submit">Filter</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','registry',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Identity</th><th>Applicant</th><th>Status</th><th>Classification</th><th>Assigned Staff</th><th>Updated</th><th>Action</th></tr></thead><tbody><?php if(!$registry_records): ?><tr><td colspan="7" class="soc-empty">No Registry identities found.</td></tr><?php endif; ?><?php foreach($registry_records as $record): $assignee=$record->assigned_user_id?get_user_by('id',(int)$record->assigned_user_id):false; ?><tr><td><strong>/<?php echo esc_html($record->identity_normalized); ?></strong></td><td><?php echo esc_html($record->owner_email ?: $record->reservation_email ?: 'Not available'); ?></td><td><span class="soc-badge"><?php echo esc_html(self::registry_status_label($record->status)); ?></span></td><td><?php echo esc_html(self::registry_class_label($record->classification)); ?></td><td><?php echo esc_html($assignee?$assignee->display_name:'Unassigned'); ?></td><td><?php echo esc_html($record->last_updated?mysql2date('M j, Y',$record->last_updated):'—'); ?></td><td><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'registry','view_registry'=>$record->id],$base_url)); ?>">View Details</a></td></tr><?php endforeach; ?></tbody></table></div></section>
+            <?php endif; ?>
         <?php elseif($section==='partners'): ?>
             <?php
             $partner_counts=['total'=>0,'active'=>0,'pending'=>0,'suspended'=>0];
