@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.4.8.3
+ * Version: 1.5.2
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.4.8.3';
+    const VERSION = '1.5.2';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -1597,12 +1597,43 @@ final class Surface_Operations_Console {
 
         $action = sanitize_key(wp_unslash($_POST['surface_operations_surfacetooth_action']));
         if ($action === 'edit') {
-            $title=sanitize_text_field(wp_unslash($_POST['surfacetooth_title']??''));
-            $description=sanitize_textarea_field(wp_unslash($_POST['surfacetooth_description']??''));
-            $channels=sanitize_text_field(wp_unslash($_POST['surfacetooth_channels']??''));
-            if($title!=='') wp_update_post(['ID'=>$post_id,'post_title'=>$title,'post_content'=>$description]);
-            update_post_meta($post_id,'_surface_operations_channels',$channels);
-            self::audit('surfacetooth.edited','surfacetooth',(string)$post_id,'Edited SurfaceTooth: '.get_the_title($post_id),['channels'=>$channels]);
+            $title = sanitize_text_field(wp_unslash($_POST['surfacetooth_title'] ?? ''));
+            $description = sanitize_textarea_field(wp_unslash($_POST['surfacetooth_description'] ?? ''));
+            $partner_id = self::surfacetooth_partner_id($post);
+
+            if ($title !== '') {
+                $post_update = [
+                    'ID'           => $post_id,
+                    'post_title'   => $title,
+                    'post_content' => $description,
+                ];
+                if ($post->post_type === 'surface_signal') {
+                    update_post_meta($post_id, '_surface_signal_message', $description);
+                }
+                wp_update_post($post_update);
+            }
+
+            $updated_channels = [];
+            if ($partner_id) {
+                foreach (self::surfacetooth_channel_fields() as $meta_key => $label) {
+                    $submitted = isset($_POST[$meta_key])
+                        ? sanitize_text_field(wp_unslash($_POST[$meta_key]))
+                        : '';
+                    update_user_meta($partner_id, $meta_key, $submitted);
+                    $updated_channels[$label] = $submitted;
+                }
+            }
+
+            self::audit(
+                'surfacetooth.edited',
+                'surfacetooth',
+                (string) $post_id,
+                'Edited SurfaceTooth and partner channels: ' . get_the_title($post_id),
+                [
+                    'partner_id' => $partner_id,
+                    'channels'   => $updated_channels,
+                ]
+            );
             wp_safe_redirect(add_query_arg(['soc_section'=>'surfaceteeth','view_surfacetooth'=>$post_id,'surfacetooth_notice'=>'edited'],home_url('/'.self::CONSOLE_SLUG.'/'))); exit;
         }
         if (!in_array($action, ['suspend', 'reactivate'], true) || !self::can_enforce($user->ID)) return;
@@ -1679,18 +1710,73 @@ final class Surface_Operations_Console {
         return $post->post_excerpt ?: wp_strip_all_tags($post->post_content);
     }
 
-    private static function surfacetooth_channels($post) {
-        if (!$post) return 'Not specified';
-        $items = [];
-        if ($post->post_type === 'surface_signal') {
-            $target = (string) get_post_meta($post->ID, '_surface_signal_target', true);
-            $cta = (string) get_post_meta($post->ID, '_surface_signal_cta_url', true);
-            if ($target !== '') $items[] = 'Surface target';
-            if ($cta !== '') $items[] = 'CTA destination';
-        } else {
-            $items[] = 'Market destination';
+    private static function surfacetooth_channel_fields() {
+        return [
+            'surface_whatsapp'  => 'WhatsApp',
+            'surface_instagram' => 'Instagram',
+            'surface_facebook'  => 'Facebook',
+            'surface_x'         => 'X (Twitter)',
+            'surface_tiktok'    => 'TikTok',
+            'surface_youtube'   => 'YouTube',
+            'surface_website'   => 'Website',
+        ];
+    }
+
+    private static function surfacetooth_channel_values($post) {
+        if (!$post) return [];
+        $partner_id = self::surfacetooth_partner_id($post);
+        if (!$partner_id) return [];
+
+        $values = [];
+        foreach (self::surfacetooth_channel_fields() as $meta_key => $label) {
+            $values[$meta_key] = trim((string) get_user_meta($partner_id, $meta_key, true));
         }
-        return $items ? implode(' · ', array_unique($items)) : 'Not specified';
+        return $values;
+    }
+
+    private static function surfacetooth_channels($post) {
+        $values = self::surfacetooth_channel_values($post);
+        $channels = [];
+        foreach (self::surfacetooth_channel_fields() as $meta_key => $label) {
+            if (($values[$meta_key] ?? '') !== '') {
+                $channels[] = $label . ': ' . $values[$meta_key];
+            }
+        }
+        return implode(' · ', $channels);
+    }
+
+    private static function surfacetooth_media_summary($post) {
+        if (!$post) return 'No media';
+
+        $media_types = [];
+        $registry = get_post_meta($post->ID, '_surface_media_registry', true);
+
+        if (is_array($registry)) {
+            foreach (['image' => 'Image', 'video' => 'Video'] as $key => $label) {
+                $entry = $registry[$key] ?? null;
+                if (is_array($entry) && !empty($entry['url'])) $media_types[] = $label;
+                elseif (is_string($entry) && trim($entry) !== '') $media_types[] = $label;
+            }
+        }
+
+        $prefix = $post->post_type === 'surface_signal' ? '_surface_signal_' : '_surface_market_';
+        foreach (['image' => 'Image', 'video' => 'Video'] as $key => $label) {
+            $urls = [
+                get_post_meta($post->ID, $prefix . $key . '_url', true),
+                get_post_meta($post->ID, $prefix . $key . '_ready_url', true),
+            ];
+            foreach ($urls as $url) {
+                if (trim((string) $url) !== '') {
+                    $media_types[] = $label;
+                    break;
+                }
+            }
+        }
+
+        if (has_post_thumbnail($post->ID)) $media_types[] = 'Image';
+
+        $media_types = array_values(array_unique($media_types));
+        return $media_types ? implode(' · ', $media_types) . ' available' : 'No media';
     }
 
     private static function surface_teeth($search = '') {
@@ -2078,6 +2164,28 @@ final class Surface_Operations_Console {
         $table=$wpdb->prefix.'surface_operations_audit';
         if (!self::table_exists($table)) return [];
         return $wpdb->get_results($wpdb->prepare("SELECT * FROM {$table} WHERE object_type='bundle' AND object_id=%s ORDER BY created_at DESC LIMIT %d",(string)$bundle_id,$limit));
+    }
+
+    private static function registry_audit_history($registry_id, $limit=20) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'surface_operations_audit';
+        if (!self::table_exists($table)) return [];
+        return $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM {$table} WHERE object_type='registry' AND object_id=%s ORDER BY created_at DESC LIMIT %d",
+            (string) $registry_id,
+            $limit
+        ));
+    }
+
+    private static function surfacetooth_audit_history($surfacetooth_id, $limit=20) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'surface_operations_audit';
+        if (!self::table_exists($table)) return [];
+        return $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM {$table} WHERE object_type='surfacetooth' AND object_id=%s ORDER BY created_at DESC LIMIT %d",
+            (string) $surfacetooth_id,
+            $limit
+        ));
     }
 
     public static function handle_bundle_actions() {
@@ -2955,29 +3063,45 @@ final class Surface_Operations_Console {
                 $owner_phone=$owner?(string)get_user_meta($owner->ID,'surface_phone',true):'';
                 $assigned=$view_registry->assigned_user_id?get_user_by('id',(int)$view_registry->assigned_user_id):false;
                 $display_email=$view_registry->owner_email ?: $view_registry->reservation_email;
+                $registry_history=self::registry_audit_history($view_registry->id,20);
+                $status_key=sanitize_key((string)$view_registry->status);
+                $status_tone=in_array($status_key,['active','payment_confirmed'],true)?'#065f46':(in_array($status_key,['rejected','suspended','expired'],true)?'#991b1b':'#92400e');
+                $status_bg=in_array($status_key,['active','payment_confirmed'],true)?'#ecfdf5':(in_array($status_key,['rejected','suspended','expired'],true)?'#fef2f2':'#fffbeb');
             ?>
-            <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">/<?php echo esc_html($view_registry->identity_normalized); ?></h2><p>Surface Internet Identity case details.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','registry',$base_url)); ?>">Back to Registry</a></div>
-            <div class="soc-partner-profile">
-              <div class="soc-profile-field"><span>Identity</span><strong>/<?php echo esc_html($view_registry->identity_normalized); ?></strong></div>
-              <div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(self::registry_status_label($view_registry->status)); ?></strong></div>
-              <div class="soc-profile-field"><span>Classification</span><strong><?php echo esc_html(self::registry_class_label($view_registry->classification)); ?></strong></div>
-              <div class="soc-profile-field"><span>Applicant</span><strong><?php echo esc_html($owner?$owner->display_name:'Not yet linked'); ?></strong></div>
-              <div class="soc-profile-field"><span>Email</span><strong><?php echo esc_html($display_email ?: 'Not available'); ?></strong></div>
-              <div class="soc-profile-field"><span>Phone</span><strong><?php echo esc_html($owner_phone ?: 'Not available'); ?></strong></div>
-              <div class="soc-profile-field"><span>Payment</span><strong><?php echo $view_registry->amount_paid!==null ? esc_html(($view_registry->currency?:'NGN').' '.number_format_i18n((float)$view_registry->amount_paid,2)) : 'Not confirmed'; ?></strong></div>
-              <div class="soc-profile-field"><span>Payment Reference</span><strong><?php echo esc_html($view_registry->payment_reference ?: 'Not available'); ?></strong></div>
-              <div class="soc-profile-field"><span>Reservation Source</span><strong><?php echo esc_html(ucwords(str_replace('_',' ',$view_registry->created_source))); ?></strong></div>
-              <div class="soc-profile-field"><span>Registered</span><strong><?php echo esc_html($view_registry->registered_at?mysql2date('M j, Y g:i a',$view_registry->registered_at):'Not available'); ?></strong></div>
-              <div class="soc-profile-field"><span>Reservation Expires</span><strong><?php echo esc_html($view_registry->reservation_expires_at?mysql2date('M j, Y g:i a',$view_registry->reservation_expires_at):'Not applicable'); ?></strong></div>
-              <div class="soc-profile-field"><span>Last Updated</span><strong><?php echo esc_html($view_registry->last_updated?mysql2date('M j, Y g:i a',$view_registry->last_updated):'Not available'); ?></strong></div>
-              <div class="soc-profile-field"><span>Assigned Staff</span><strong><?php echo esc_html($assigned?$assigned->display_name:'Unassigned'); ?></strong></div>
-              <div class="soc-profile-field"><span>Priority</span><strong><?php echo esc_html(ucfirst($view_registry->priority ?: 'normal')); ?></strong></div>
-              <?php if($view_registry->internal_notes): ?><div class="soc-profile-field" style="grid-column:1/-1"><span>Internal Notes</span><strong><?php echo nl2br(esc_html($view_registry->internal_notes)); ?></strong></div><?php endif; ?>
-            </div></section>
-            <section class="soc-columns" style="margin-top:0;margin-bottom:18px">
-              <div class="soc-panel"><h2>Assignment</h2><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_registry','surface_operations_registry_nonce'); ?><input type="hidden" name="surface_operations_registry_action" value="assign"><input type="hidden" name="registry_id" value="<?php echo esc_attr($view_registry->id); ?>"><label>Assign to staff<select name="assigned_user_id"><option value="0">Surface Identity team queue</option><?php foreach($staff_list as $member){if(self::staff_status($member->ID)==='suspended')continue;echo '<option value="'.esc_attr($member->ID).'" '.selected((int)$view_registry->assigned_user_id,$member->ID,false).'>'.esc_html($member->display_name.' · '.self::user_team($member->ID)).'</option>';} ?></select></label><label>Priority<select name="registry_priority"><?php foreach(['low'=>'Low','normal'=>'Normal','high'=>'High','urgent'=>'Urgent'] as $k=>$v)echo '<option value="'.esc_attr($k).'" '.selected((string)$view_registry->priority,$k,false).'>'.esc_html($v).'</option>'; ?></select></label><label>Internal notes<textarea name="registry_notes"><?php echo esc_textarea($view_registry->internal_notes); ?></textarea></label><button class="soc-btn" type="submit">Save Assignment</button></form></div>
-              <div class="soc-panel"><h2>Lifecycle Actions</h2><?php if(self::can_enforce($user->ID)): ?><p class="soc-meta">Only transitions permitted by the Registry lifecycle are shown.</p><div class="soc-actions"><?php foreach(['active'=>'Approve / Activate','rejected'=>'Reject','suspended'=>'Suspend','expired'=>'Expire'] as $target=>$label){if(!self::registry_can_transition($view_registry->status,$target))continue; if($target==='active' && $view_registry->status==='suspended')$label='Reactivate'; ?><form method="post"><?php wp_nonce_field('surface_operations_registry','surface_operations_registry_nonce'); ?><input type="hidden" name="surface_operations_registry_action" value="transition"><input type="hidden" name="registry_id" value="<?php echo esc_attr($view_registry->id); ?>"><input type="hidden" name="registry_status" value="<?php echo esc_attr($target); ?>"><button class="soc-btn <?php echo $target==='active'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($label); ?></button></form><?php } ?></div><?php else: ?><p class="soc-meta">Lifecycle decisions are restricted to the Operations Director. You may review the case, update its assignment and notes, or escalate it through the existing workflow.</p><?php endif; ?></div>
+            <section class="soc-panel" style="margin-bottom:18px;padding:0;overflow:hidden">
+                <div style="padding:24px;border-bottom:1px solid #e5e7eb;background:linear-gradient(135deg,#ffffff 0%,#f8fafc 100%)">
+                    <div class="soc-top" style="margin:0;align-items:flex-start">
+                        <div style="display:flex;gap:14px;align-items:flex-start">
+                            <div style="width:50px;height:50px;border-radius:16px;background:#111827;color:#fff;display:grid;place-items:center;font-size:23px;font-weight:800">/</div>
+                            <div><div class="soc-meta" style="margin-bottom:5px">Surface Internet Identity</div><h2 style="margin:0 0 7px;font-size:28px">/<?php echo esc_html($view_registry->identity_normalized); ?></h2><span class="soc-badge" style="background:<?php echo esc_attr($status_bg); ?>;color:<?php echo esc_attr($status_tone); ?>;border:0"><?php echo esc_html(self::registry_status_label($view_registry->status)); ?></span></div>
+                        </div>
+                        <a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','registry',$base_url)); ?>">Back to Registry</a>
+                    </div>
+                </div>
+                <div style="padding:22px">
+                    <div class="soc-partner-profile">
+                        <div class="soc-profile-field"><span>Classification</span><strong><?php echo esc_html(self::registry_class_label($view_registry->classification)); ?></strong></div>
+                        <div class="soc-profile-field"><span>Applicant</span><strong><?php echo esc_html($owner?$owner->display_name:'Not yet linked'); ?></strong></div>
+                        <div class="soc-profile-field"><span>Email</span><strong><?php echo esc_html($display_email ?: 'Not available'); ?></strong></div>
+                        <div class="soc-profile-field"><span>Phone</span><strong><?php echo esc_html($owner_phone ?: 'Not available'); ?></strong></div>
+                        <div class="soc-profile-field"><span>Payment</span><strong><?php echo $view_registry->amount_paid!==null ? esc_html(($view_registry->currency?:'NGN').' '.number_format_i18n((float)$view_registry->amount_paid,2)) : 'Not confirmed'; ?></strong></div>
+                        <div class="soc-profile-field"><span>Payment Reference</span><strong><?php echo esc_html($view_registry->payment_reference ?: 'Not available'); ?></strong></div>
+                        <div class="soc-profile-field"><span>Source</span><strong><?php echo esc_html(ucwords(str_replace('_',' ',$view_registry->created_source))); ?></strong></div>
+                        <div class="soc-profile-field"><span>Registered</span><strong><?php echo esc_html($view_registry->registered_at?mysql2date('M j, Y g:i a',$view_registry->registered_at):'Not available'); ?></strong></div>
+                        <div class="soc-profile-field"><span>Reservation Expires</span><strong><?php echo esc_html($view_registry->reservation_expires_at?mysql2date('M j, Y g:i a',$view_registry->reservation_expires_at):'Not applicable'); ?></strong></div>
+                        <div class="soc-profile-field"><span>Last Updated</span><strong><?php echo esc_html($view_registry->last_updated?mysql2date('M j, Y g:i a',$view_registry->last_updated):'Not available'); ?></strong></div>
+                        <div class="soc-profile-field"><span>Assigned Staff</span><strong><?php echo esc_html($assigned?$assigned->display_name:'Surface Identity queue'); ?></strong></div>
+                        <div class="soc-profile-field"><span>Priority</span><strong><?php echo esc_html(ucfirst($view_registry->priority ?: 'normal')); ?></strong></div>
+                    </div>
+                </div>
             </section>
+
+            <section class="soc-columns" style="margin-top:0;margin-bottom:18px;align-items:start">
+                <div class="soc-panel"><h2 style="margin-bottom:5px">Case Management</h2><p class="soc-meta" style="margin-top:0">Assign responsibility and keep internal review notes.</p><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_registry','surface_operations_registry_nonce'); ?><input type="hidden" name="surface_operations_registry_action" value="assign"><input type="hidden" name="registry_id" value="<?php echo esc_attr($view_registry->id); ?>"><label>Assign to staff<select name="assigned_user_id"><option value="0">Surface Identity team queue</option><?php foreach($staff_list as $member){if(self::staff_status($member->ID)==='suspended')continue;echo '<option value="'.esc_attr($member->ID).'" '.selected((int)$view_registry->assigned_user_id,$member->ID,false).'>'.esc_html($member->display_name.' · '.self::user_team($member->ID)).'</option>';} ?></select></label><label>Priority<select name="registry_priority"><?php foreach(['low'=>'Low','normal'=>'Normal','high'=>'High','urgent'=>'Urgent'] as $k=>$v)echo '<option value="'.esc_attr($k).'" '.selected((string)$view_registry->priority,$k,false).'>'.esc_html($v).'</option>'; ?></select></label><label>Internal notes<textarea rows="6" name="registry_notes" placeholder="Record review findings, verification needs or handover notes."><?php echo esc_textarea($view_registry->internal_notes); ?></textarea></label><button class="soc-btn" type="submit">Save Case</button></form></div>
+                <div class="soc-panel"><h2 style="margin-bottom:5px">Lifecycle Control</h2><?php if(self::can_enforce($user->ID)): ?><p class="soc-meta" style="margin-top:0">Only valid Registry lifecycle transitions are available.</p><div class="soc-actions" style="margin-top:16px"><?php $shown_action=false; foreach(['active'=>'Approve / Activate','rejected'=>'Reject','suspended'=>'Suspend','expired'=>'Expire'] as $target=>$label){if(!self::registry_can_transition($view_registry->status,$target))continue; $shown_action=true; if($target==='active' && $view_registry->status==='suspended')$label='Reactivate'; ?><form method="post" onsubmit="return confirm('<?php echo esc_js($label.' /'.$view_registry->identity_normalized.'?'); ?>');"><?php wp_nonce_field('surface_operations_registry','surface_operations_registry_nonce'); ?><input type="hidden" name="surface_operations_registry_action" value="transition"><input type="hidden" name="registry_id" value="<?php echo esc_attr($view_registry->id); ?>"><input type="hidden" name="registry_status" value="<?php echo esc_attr($target); ?>"><button class="soc-btn <?php echo $target==='active'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($label); ?></button></form><?php } if(!$shown_action): ?><div class="soc-empty">No lifecycle action is currently available.</div><?php endif; ?></div><?php else: ?><p class="soc-meta" style="margin-top:0">Lifecycle decisions are restricted to the Operations Director. Review the case, update notes, assign it, or escalate it.</p><div style="margin-top:16px"><?php echo self::escalation_form('registry',$view_registry->id,'/'.$view_registry->identity_normalized,$view_registry->status==='suspended'?'reactivate':'suspend'); ?></div><?php endif; ?></div>
+            </section>
+
+            <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:14px"><div><h2 style="margin:0 0 5px">Operational Timeline</h2><p class="soc-meta" style="margin:0">Recent Registry activity recorded by the Operations Console.</p></div></div><?php if(!$registry_history): ?><div class="soc-empty">No operational activity has been recorded for this identity yet.</div><?php else: ?><div style="display:grid;gap:12px"><?php foreach($registry_history as $event): $actor=$event->actor_user_id?self::staff_name($event->actor_user_id):'System'; ?><article style="display:grid;grid-template-columns:14px 1fr;gap:12px;align-items:start"><span style="width:10px;height:10px;border-radius:50%;background:#111827;margin-top:6px"></span><div style="border-bottom:1px solid #eef2f7;padding-bottom:12px"><strong><?php echo esc_html($event->summary); ?></strong><div class="soc-meta"><?php echo esc_html($actor.' · '.mysql2date('M j, Y g:i a',$event->created_at)); ?></div></div></article><?php endforeach; ?></div><?php endif; ?></section>
             <?php endif; ?>
             <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="registry"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="registry_search" value="<?php echo esc_attr($registry_search); ?>" placeholder="Search identity, email or payment reference"></label><label>Status<select name="registry_status"><option value="">All statuses</option><?php $statuses=class_exists('Surface_Identity_Registry')?Surface_Identity_Registry::get_statuses():[]; foreach($statuses as $k=>$v){if($k==='available')continue;echo '<option value="'.esc_attr($k).'" '.selected($registry_status,$k,false).'>'.esc_html($v).'</option>';} ?></select></label><button class="soc-btn" type="submit">Filter</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','registry',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Identity</th><th>Applicant</th><th>Status</th><th>Classification</th><th>Assigned Staff</th><th>Updated</th><th>Action</th></tr></thead><tbody><?php if(!$registry_records): ?><tr><td colspan="7" class="soc-empty">No Registry identities found.</td></tr><?php endif; ?><?php foreach($registry_records as $record): $assignee=$record->assigned_user_id?get_user_by('id',(int)$record->assigned_user_id):false; ?><tr><td><strong>/<?php echo esc_html($record->identity_normalized); ?></strong></td><td><?php echo esc_html($record->owner_email ?: $record->reservation_email ?: 'Not available'); ?></td><td><span class="soc-badge"><?php echo esc_html(self::registry_status_label($record->status)); ?></span></td><td><?php echo esc_html(self::registry_class_label($record->classification)); ?></td><td><?php echo esc_html($assignee?$assignee->display_name:'Unassigned'); ?></td><td><?php echo esc_html($record->last_updated?mysql2date('M j, Y',$record->last_updated):'—'); ?></td><td><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'registry','view_registry'=>$record->id],$base_url)); ?>">View Details</a></td></tr><?php endforeach; ?></tbody></table></div></section>
             <?php endif; ?>
@@ -3013,9 +3137,24 @@ final class Surface_Operations_Console {
                 $vt_partner_id=self::surfacetooth_partner_id($view_surfacetooth);
                 $vt_partner=$vt_partner_id?get_user_by('id',$vt_partner_id):false;
                 $vt_store=$vt_partner_id?(string)get_user_meta($vt_partner_id,'surface_store',true):'';
+                $vt_status=self::surfacetooth_status($view_surfacetooth);
+                $vt_type=self::surfacetooth_type($view_surfacetooth);
+                $vt_sii=self::surfacetooth_sii($view_surfacetooth);
+                $vt_channels=self::surfacetooth_channels($view_surfacetooth);
+                $vt_channel_values=self::surfacetooth_channel_values($view_surfacetooth);
+                $vt_history=self::surfacetooth_audit_history($view_surfacetooth->ID,20);
+                $vt_destination=(string)(get_post_meta($view_surfacetooth->ID,'_surface_destination',true) ?: get_post_meta($view_surfacetooth->ID,'surface_destination',true));
+                $vt_media_summary=self::surfacetooth_media_summary($view_surfacetooth);
             ?>
-                <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:18px"><div><h2 style="margin:0">SurfaceTooth Details</h2><p>Read-only operational view.</p></div><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Back to SurfaceTeeth</a></div><div class="soc-partner-profile"><div class="soc-profile-field"><span>Title</span><strong><?php echo esc_html($view_surfacetooth->post_title); ?></strong></div><div class="soc-profile-field"><span>Type</span><strong><?php echo esc_html(self::surfacetooth_type($view_surfacetooth).' SurfaceTooth'); ?></strong></div><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vt_store ?: ($vt_partner ? $vt_partner->display_name : 'Unknown partner')); ?></strong></div><div class="soc-profile-field"><span>SII</span><strong>/<?php echo esc_html(self::surfacetooth_sii($view_surfacetooth) ?: 'Not assigned'); ?></strong></div><div class="soc-profile-field"><span>Status</span><strong><?php echo esc_html(ucfirst(self::surfacetooth_status($view_surfacetooth))); ?></strong></div><div class="soc-profile-field"><span>Channels</span><strong><?php echo esc_html(self::surfacetooth_channels($view_surfacetooth)); ?></strong></div><div class="soc-profile-field"><span>Bundle Summary</span><strong><?php echo esc_html($vt_partner_id?self::partner_bundle_summary($vt_partner_id):'Not available'); ?></strong></div><div class="soc-profile-field"><span>Created</span><strong><?php echo esc_html(mysql2date('M j, Y',$view_surfacetooth->post_date)); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Description</span><strong><?php echo nl2br(esc_html(self::surfacetooth_description($view_surfacetooth) ?: 'No description available')); ?></strong></div></div></section>
-                <section class="soc-panel" style="margin-bottom:18px"><h2>Edit SurfaceTooth & Channels</h2><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_surfacetooth','surface_operations_surfacetooth_nonce'); ?><input type="hidden" name="surface_operations_surfacetooth_action" value="edit"><input type="hidden" name="surfacetooth_id" value="<?php echo esc_attr($view_surfacetooth->ID); ?>"><label>Title<input name="surfacetooth_title" value="<?php echo esc_attr($view_surfacetooth->post_title); ?>" required></label><label>Description<textarea name="surfacetooth_description"><?php echo esc_textarea(self::surfacetooth_description($view_surfacetooth)); ?></textarea></label><label>Surface Channels<input name="surfacetooth_channels" value="<?php echo esc_attr(get_post_meta($view_surfacetooth->ID,'_surface_operations_channels',true) ?: self::surfacetooth_channels($view_surfacetooth)); ?>"></label><button class="soc-btn" type="submit">Save Changes</button></form></section>
+                <section class="soc-panel" style="margin-bottom:18px">
+                    <div class="soc-top" style="margin-bottom:18px"><div><div class="soc-meta"><?php echo esc_html($vt_type.' SurfaceTooth'); ?></div><h2 style="margin:4px 0 6px"><?php echo esc_html($view_surfacetooth->post_title); ?></h2><p style="margin:0"><?php echo esc_html($vt_sii?'/'.$vt_sii:'SII not assigned'); ?></p></div><div class="soc-actions"><span class="soc-badge"><?php echo esc_html(ucfirst($vt_status)); ?></span><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Back to SurfaceTeeth</a></div></div>
+                    <div class="soc-partner-profile"><div class="soc-profile-field"><span>Partner</span><strong><?php echo esc_html($vt_store ?: ($vt_partner ? $vt_partner->display_name : 'Unknown partner')); ?></strong></div><div class="soc-profile-field"><span>Partner SII</span><strong><?php echo esc_html($vt_partner_id && self::partner_sii($vt_partner_id)?'/'.self::partner_sii($vt_partner_id):'Not assigned'); ?></strong></div><div class="soc-profile-field"><span>SurfaceTooth Type</span><strong><?php echo esc_html($vt_type); ?></strong></div><div class="soc-profile-field"><span>Post ID</span><strong>#<?php echo esc_html($view_surfacetooth->ID); ?></strong></div><div class="soc-profile-field"><span>Created</span><strong><?php echo esc_html(mysql2date('M j, Y g:i a',$view_surfacetooth->post_date)); ?></strong></div><div class="soc-profile-field"><span>Last Updated</span><strong><?php echo esc_html(mysql2date('M j, Y g:i a',$view_surfacetooth->post_modified)); ?></strong></div><div class="soc-profile-field"><span>Surface Channels</span><strong><?php echo esc_html($vt_channels ?: 'No channels recorded'); ?></strong></div><div class="soc-profile-field"><span>Destination</span><strong><?php echo esc_html($vt_destination ?: 'Uses current SurfaceTooth resolver destination'); ?></strong></div><div class="soc-profile-field"><span>Bundle Summary</span><strong><?php echo esc_html($vt_partner_id?self::partner_bundle_summary($vt_partner_id):'Not available'); ?></strong></div><div class="soc-profile-field"><span>Featured Media</span><strong><?php echo esc_html($vt_media_summary); ?></strong></div><div class="soc-profile-field" style="grid-column:1/-1"><span>Description</span><strong><?php echo nl2br(esc_html(self::surfacetooth_description($view_surfacetooth) ?: 'No description available')); ?></strong></div></div>
+                </section>
+                <section class="soc-columns" style="margin-top:0;margin-bottom:18px;align-items:start">
+                    <div class="soc-panel"><h2 style="margin-bottom:5px">Operational Editing</h2><p class="soc-meta" style="margin-top:0">Edit the actual SurfaceTooth and partner onboarding records. Saved channel corrections remain synchronized with My Surface.</p><form class="soc-form" method="post"><?php wp_nonce_field('surface_operations_surfacetooth','surface_operations_surfacetooth_nonce'); ?><input type="hidden" name="surface_operations_surfacetooth_action" value="edit"><input type="hidden" name="surfacetooth_id" value="<?php echo esc_attr($view_surfacetooth->ID); ?>"><label>Title<input name="surfacetooth_title" value="<?php echo esc_attr($view_surfacetooth->post_title); ?>" required></label><label>Description<textarea rows="6" name="surfacetooth_description"><?php echo esc_textarea(self::surfacetooth_description($view_surfacetooth)); ?></textarea></label><h3 style="margin:8px 0 0">Surface Channels</h3><p class="soc-meta" style="margin:0 0 4px">These are the partner's real My Surface onboarding channels.</p><?php foreach(self::surfacetooth_channel_fields() as $channel_key=>$channel_label): ?><label><?php echo esc_html($channel_label); ?><input name="<?php echo esc_attr($channel_key); ?>" value="<?php echo esc_attr($vt_channel_values[$channel_key] ?? ''); ?>" placeholder="Enter <?php echo esc_attr($channel_label); ?> channel"></label><?php endforeach; ?><button class="soc-btn" type="submit">Save Changes</button></form></div>
+                    <div class="soc-panel"><h2 style="margin-bottom:5px">Lifecycle Control</h2><?php if(self::can_enforce($user->ID)): ?><p class="soc-meta" style="margin-top:0">Operations Director controls operational availability.</p><div class="soc-actions" style="margin-top:16px"><form method="post" onsubmit="return confirm('<?php echo esc_js(($vt_status==='suspended'?'Reactivate ':'Suspend ').$view_surfacetooth->post_title.'?'); ?>');"><?php wp_nonce_field('surface_operations_surfacetooth','surface_operations_surfacetooth_nonce'); ?><input type="hidden" name="surfacetooth_id" value="<?php echo esc_attr($view_surfacetooth->ID); ?>"><input type="hidden" name="surface_operations_surfacetooth_action" value="<?php echo esc_attr($vt_status==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $vt_status==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($vt_status==='suspended'?'Reactivate':'Suspend'); ?></button></form></div><?php else: ?><p class="soc-meta" style="margin-top:0">Lifecycle decisions are restricted to the Operations Director. Other staff may review, edit permitted fields, and escalate.</p><div style="margin-top:16px"><?php echo self::escalation_form('surfacetooth',$view_surfacetooth->ID,$view_surfacetooth->post_title,$vt_status==='suspended'?'reactivate':'suspend'); ?></div><?php endif; ?></div>
+                </section>
+                <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:14px"><div><h2 style="margin:0 0 5px">Operational Timeline</h2><p class="soc-meta" style="margin:0">Recent SurfaceTooth activity recorded by the Operations Console.</p></div></div><?php if(!$vt_history): ?><div class="soc-empty">No operational activity has been recorded for this SurfaceTooth yet.</div><?php else: ?><div style="display:grid;gap:12px"><?php foreach($vt_history as $event): $actor=$event->actor_user_id?self::staff_name($event->actor_user_id):'System'; ?><article style="display:grid;grid-template-columns:14px 1fr;gap:12px;align-items:start"><span style="width:10px;height:10px;border-radius:50%;background:#111827;margin-top:6px"></span><div style="border-bottom:1px solid #e5e7eb;padding-bottom:12px"><strong><?php echo esc_html($event->summary); ?></strong><div class="soc-meta"><?php echo esc_html($actor.' · '.mysql2date('M j, Y g:i a',$event->created_at)); ?></div></div></article><?php endforeach; ?></div><?php endif; ?></section>
             <?php endif; ?>
             <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="surfaceteeth"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="surfacetooth_search" value="<?php echo esc_attr($surfacetooth_search); ?>" placeholder="Search title, SII or partner"></label><button class="soc-btn" type="submit">Search</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','surfaceteeth',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Title</th><th>Type</th><th>Partner</th><th>SII</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead><tbody><?php if(!$surfaceteeth): ?><tr><td colspan="7" class="soc-empty">No SurfaceTeeth found.</td></tr><?php endif; ?><?php foreach($surfaceteeth as $tooth): $ts=self::surfacetooth_status($tooth); $tp_id=self::surfacetooth_partner_id($tooth); $tp=$tp_id?get_user_by('id',$tp_id):false; $tp_store=$tp_id?(string)get_user_meta($tp_id,'surface_store',true):''; ?><tr><td><strong><?php echo esc_html($tooth->post_title); ?></strong></td><td><?php echo esc_html(self::surfacetooth_type($tooth)); ?></td><td><?php echo esc_html($tp_store ?: ($tp?$tp->display_name:'Unknown')); ?></td><td>/<?php echo esc_html(self::surfacetooth_sii($tooth) ?: '—'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($ts)); ?></span></td><td><?php echo esc_html(mysql2date('M j, Y',$tooth->post_date)); ?></td><td><div class="soc-actions"><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'surfaceteeth','view_surfacetooth'=>$tooth->ID],$base_url)); ?>">View</a><?php if(self::can_enforce($user->ID)): ?><form method="post"><?php wp_nonce_field('surface_operations_surfacetooth','surface_operations_surfacetooth_nonce'); ?><input type="hidden" name="surfacetooth_id" value="<?php echo esc_attr($tooth->ID); ?>"><input type="hidden" name="surface_operations_surfacetooth_action" value="<?php echo esc_attr($ts==='suspended'?'reactivate':'suspend'); ?>"><button class="soc-btn <?php echo $ts==='suspended'?'':'soc-btn-light'; ?>" type="submit"><?php echo esc_html($ts==='suspended'?'Reactivate':'Suspend'); ?></button></form><?php else: echo self::escalation_form('surfacetooth',$tooth->ID,$tooth->post_title,$ts==='suspended'?'reactivate':'suspend'); endif; ?></div></td></tr><?php endforeach; ?></tbody></table></div></section>
         <?php elseif($section==='advocates'):
