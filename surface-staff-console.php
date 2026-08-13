@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Surface Operations Console
  * Description: Internal Surface Internet operations, staff access, hierarchy, tasks and audit foundation.
- * Version: 1.5.4
+ * Version: 1.5.6
  * Author: KX
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Surface_Operations_Console {
 
-    const VERSION = '1.5.4';
+    const VERSION = '1.5.5';
     const ROLE = 'surface_staff';
     const LOGIN_SLUG = 'staff-login';
     const CONSOLE_SLUG = 'surface-staff-console';
@@ -28,6 +28,7 @@ final class Surface_Operations_Console {
         add_action('template_redirect', [__CLASS__, 'handle_analytics_export'], 4);
         add_action('template_redirect', [__CLASS__, 'handle_task_actions'], 5);
         add_action('template_redirect', [__CLASS__, 'handle_registry_actions'], 5);
+        add_action('template_redirect', [__CLASS__, 'handle_protected_sii_actions'], 5);
         add_action('template_redirect', [__CLASS__, 'handle_partner_actions'], 6);
         add_action('template_redirect', [__CLASS__, 'handle_surfacetooth_actions'], 7);
         add_action('template_redirect', [__CLASS__, 'handle_campaign_actions'], 8);
@@ -3067,6 +3068,58 @@ final class Surface_Operations_Console {
         wp_safe_redirect($redirect); exit;
     }
 
+    public static function handle_protected_sii_actions() {
+        if (!is_user_logged_in() || !self::is_staff() || !self::can_access('registry', get_current_user_id())) return;
+        if (empty($_POST['surface_operations_protected_sii_action'])) return;
+        check_admin_referer('surface_operations_protected_sii','surface_operations_protected_sii_nonce');
+
+        $base = home_url('/'.self::CONSOLE_SLUG.'/');
+        $redirect = add_query_arg('soc_section','registry',$base);
+        $action = sanitize_key(wp_unslash($_POST['surface_operations_protected_sii_action']));
+
+        if (!class_exists('Surface_Identity_Registry')
+            || !is_callable(['Surface_Identity_Registry','save_managed_protected_identity'])) {
+            wp_safe_redirect(add_query_arg('protected_notice','registry_unavailable',$redirect));
+            exit;
+        }
+
+        if ($action === 'save') {
+            $identity = sanitize_text_field(wp_unslash($_POST['protected_identity'] ?? ''));
+            $category = sanitize_key(wp_unslash($_POST['protected_category'] ?? 'brand'));
+            $reason = sanitize_text_field(wp_unslash($_POST['protected_reason'] ?? ''));
+            $notes = sanitize_textarea_field(wp_unslash($_POST['protected_notes'] ?? ''));
+            $result = Surface_Identity_Registry::save_managed_protected_identity(
+                $identity, $category, $reason, $notes, get_current_user_id()
+            );
+            if (is_wp_error($result)) {
+                $redirect = add_query_arg('protected_error', rawurlencode($result->get_error_message()), $redirect);
+            } else {
+                $normalized = Surface_Identity_Registry::normalize_identity($identity);
+                self::audit('registry.protected_sii_saved','protected_sii',(string)$result,'Protected /'.$normalized,['category'=>$category,'reason'=>$reason]);
+                $redirect = add_query_arg('protected_notice','saved',$redirect);
+            }
+        } elseif (in_array($action, ['release','reactivate'], true)) {
+            $id = absint($_POST['protected_id'] ?? 0);
+            $status = $action === 'release' ? 'released' : 'active';
+            $ok = Surface_Identity_Registry::set_managed_protected_identity_status($id,$status,get_current_user_id());
+            if ($ok) {
+                self::audit('registry.protected_sii_'.$action,'protected_sii',(string)$id,ucfirst($action).' protected SII entry');
+                $redirect = add_query_arg('protected_notice',$action === 'release' ? 'released' : 'reactivated',$redirect);
+            } else {
+                $redirect = add_query_arg('protected_error',rawurlencode('Protected SII status could not be updated.'),$redirect);
+            }
+        }
+
+        wp_safe_redirect($redirect);
+        exit;
+    }
+
+    private static function protected_sii_rows() {
+        if (!class_exists('Surface_Identity_Registry')
+            || !is_callable(['Surface_Identity_Registry','get_managed_protected_identities'])) return [];
+        return Surface_Identity_Registry::get_managed_protected_identities(false);
+    }
+
     public static function render_console() {
         if (!is_user_logged_in() || !self::is_staff()) {
             return '<script>window.location.href=' . wp_json_encode(home_url('/' . self::LOGIN_SLUG . '/')) . ';</script>';
@@ -3085,6 +3138,10 @@ final class Surface_Operations_Console {
         $view_registry_id=absint($_GET['view_registry']??0);
         $view_registry=($section==='registry'&&$view_registry_id)?self::registry_record($view_registry_id):null;
         if($view_registry) self::audit('registry.viewed','registry',(string)$view_registry_id,'Viewed Surface Identity /'.$view_registry->identity_normalized,['status'=>$view_registry->status]);
+
+        $protected_sii_rows=$section==='registry'?self::protected_sii_rows():[];
+        $protected_notice=sanitize_key(wp_unslash($_GET['protected_notice']??''));
+        $protected_error=sanitize_text_field(wp_unslash($_GET['protected_error']??''));
 
         $task_counts = self::task_counts($user->ID, $team);
         $all_staff_ids = get_users(['role'=>self::ROLE,'fields'=>'ID']);
@@ -3275,6 +3332,33 @@ final class Surface_Operations_Console {
             <?php if(!self::registry_table_exists()): ?><section class="soc-panel"><div class="soc-empty">The Surface Identity Registry plugin or table is not available.</div></section>
             <?php else: ?>
             <section class="soc-grid" style="margin-bottom:18px"><div class="soc-stat"><span>Total Identities</span><strong><?php echo esc_html($registry_counts['total']); ?></strong></div><div class="soc-stat"><span>In Progress</span><strong><?php echo esc_html($registry_counts['pending']); ?></strong></div><div class="soc-stat"><span>Active</span><strong><?php echo esc_html($registry_counts['active']); ?></strong></div><div class="soc-stat"><span>Needs Attention</span><strong><?php echo esc_html($registry_counts['attention']); ?></strong></div></section>
+
+            <?php if($protected_notice==='saved'): ?><div class="soc-alert">Protected SII saved and Registry enforcement updated.</div><?php elseif($protected_notice==='released'): ?><div class="soc-alert">Protected SII released. It will no longer be classified as protected by the managed list.</div><?php elseif($protected_notice==='reactivated'): ?><div class="soc-alert">Protected SII reactivated.</div><?php elseif($protected_notice==='registry_unavailable'): ?><div class="soc-alert" style="background:#fef2f2;color:#991b1b">Install the Protected SII-enabled Registry plugin before managing protected identities.</div><?php endif; ?>
+            <?php if($protected_error): ?><div class="soc-alert" style="background:#fef2f2;color:#991b1b"><?php echo esc_html($protected_error); ?></div><?php endif; ?>
+
+            <section class="soc-columns" style="margin-top:0;margin-bottom:18px;align-items:start">
+                <div class="soc-panel">
+                    <h2 style="margin-bottom:5px">Protect a Surface Internet Identity</h2>
+                    <p class="soc-meta" style="margin-top:0">Add brands, institutions, government identities or other names that must require ownership verification before activation.</p>
+                    <form class="soc-form" method="post">
+                        <?php wp_nonce_field('surface_operations_protected_sii','surface_operations_protected_sii_nonce'); ?>
+                        <input type="hidden" name="surface_operations_protected_sii_action" value="save">
+                        <label>Surface Internet Identity<input name="protected_identity" required placeholder="google"></label>
+                        <label>Category<select name="protected_category"><option value="brand">Brand</option><option value="financial">Financial Institution</option><option value="government">Government / Public Institution</option><option value="media">Media</option><option value="surface">Surface Internet</option><option value="other">Other</option></select></label>
+                        <label>Reason<input name="protected_reason" placeholder="Ownership verification required"></label>
+                        <label>Internal notes<textarea rows="4" name="protected_notes" placeholder="Optional staff note"></textarea></label>
+                        <button class="soc-btn" type="submit">Protect SII</button>
+                    </form>
+                </div>
+                <div class="soc-panel">
+                    <h2 style="margin-bottom:5px">Managed Protected SIIs</h2>
+                    <p class="soc-meta" style="margin-top:0">Protection is independent of SII class. Active entries here can lock either a Regular or Premium Numeric identity as Protected; its underlying class and price remain unchanged.</p>
+                    <div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>SII</th><th>Category</th><th>Reason</th><th>Status</th><th>Action</th></tr></thead><tbody>
+                    <?php if(!$protected_sii_rows): ?><tr><td colspan="6" class="soc-empty">No staff-managed protected SIIs yet. Built-in protected names such as Google remain protected by the Registry.</td></tr><?php endif; ?>
+                    <?php foreach($protected_sii_rows as $protected): $pc=class_exists('Surface_Identity_Registry')?Surface_Identity_Registry::classify_identity($protected->identity_normalized):[]; ?><tr><td><strong>/<?php echo esc_html($protected->identity_normalized); ?></strong></td><td><?php echo esc_html($pc['classification_label'] ?? 'Regular SII'); ?></td><td><?php echo esc_html(ucwords(str_replace('_',' ',$protected->category))); ?></td><td><?php echo esc_html($protected->reason ?: 'Ownership verification required'); ?></td><td><span class="soc-badge"><?php echo esc_html(ucfirst($protected->status)); ?></span></td><td><form method="post"><?php wp_nonce_field('surface_operations_protected_sii','surface_operations_protected_sii_nonce'); ?><input type="hidden" name="surface_operations_protected_sii_action" value="<?php echo esc_attr($protected->status==='active'?'release':'reactivate'); ?>"><input type="hidden" name="protected_id" value="<?php echo esc_attr($protected->id); ?>"><button class="soc-btn soc-btn-light" type="submit"><?php echo esc_html($protected->status==='active'?'Release':'Reactivate'); ?></button></form></td></tr><?php endforeach; ?>
+                    </tbody></table></div>
+                </div>
+            </section>
             <?php if($view_registry):
                 $owner=$view_registry->owner_user_id?get_user_by('id',(int)$view_registry->owner_user_id):false;
                 $owner_phone=$owner?(string)get_user_meta($owner->ID,'surface_phone',true):'';
@@ -3320,7 +3404,7 @@ final class Surface_Operations_Console {
 
             <section class="soc-panel" style="margin-bottom:18px"><div class="soc-top" style="margin-bottom:14px"><div><h2 style="margin:0 0 5px">Operational Timeline</h2><p class="soc-meta" style="margin:0">Recent Registry activity recorded by the Operations Console.</p></div></div><?php if(!$registry_history): ?><div class="soc-empty">No operational activity has been recorded for this identity yet.</div><?php else: ?><div style="display:grid;gap:12px"><?php foreach($registry_history as $event): $actor=$event->actor_user_id?self::staff_name($event->actor_user_id):'System'; ?><article style="display:grid;grid-template-columns:14px 1fr;gap:12px;align-items:start"><span style="width:10px;height:10px;border-radius:50%;background:#111827;margin-top:6px"></span><div style="border-bottom:1px solid #eef2f7;padding-bottom:12px"><strong><?php echo esc_html($event->summary); ?></strong><div class="soc-meta"><?php echo esc_html($actor.' · '.mysql2date('M j, Y g:i a',$event->created_at)); ?></div></div></article><?php endforeach; ?></div><?php endif; ?></section>
             <?php endif; ?>
-            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="registry"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="registry_search" value="<?php echo esc_attr($registry_search); ?>" placeholder="Search identity, email or payment reference"></label><label>Status<select name="registry_status"><option value="">All statuses</option><?php $statuses=class_exists('Surface_Identity_Registry')?Surface_Identity_Registry::get_statuses():[]; foreach($statuses as $k=>$v){if($k==='available')continue;echo '<option value="'.esc_attr($k).'" '.selected($registry_status,$k,false).'>'.esc_html($v).'</option>';} ?></select></label><button class="soc-btn" type="submit">Filter</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','registry',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Identity</th><th>Applicant</th><th>Status</th><th>Classification</th><th>Assigned Staff</th><th>Updated</th><th>Action</th></tr></thead><tbody><?php if(!$registry_records): ?><tr><td colspan="7" class="soc-empty">No Registry identities found.</td></tr><?php endif; ?><?php foreach($registry_records as $record): $assignee=$record->assigned_user_id?get_user_by('id',(int)$record->assigned_user_id):false; ?><tr><td><strong>/<?php echo esc_html($record->identity_normalized); ?></strong></td><td><?php echo esc_html($record->owner_email ?: $record->reservation_email ?: 'Not available'); ?></td><td><span class="soc-badge"><?php echo esc_html(self::registry_status_label($record->status)); ?></span></td><td><?php echo esc_html(self::registry_class_label($record->classification)); ?></td><td><?php echo esc_html($assignee?$assignee->display_name:'Unassigned'); ?></td><td><?php echo esc_html($record->last_updated?mysql2date('M j, Y',$record->last_updated):'—'); ?></td><td><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'registry','view_registry'=>$record->id],$base_url)); ?>">View Details</a></td></tr><?php endforeach; ?></tbody></table></div></section>
+            <section class="soc-panel"><form class="soc-filters" method="get"><input type="hidden" name="soc_section" value="registry"><label style="flex:1;min-width:240px">Search<input style="width:100%" type="search" name="registry_search" value="<?php echo esc_attr($registry_search); ?>" placeholder="Search identity, email or payment reference"></label><label>Status<select name="registry_status"><option value="">All statuses</option><?php $statuses=class_exists('Surface_Identity_Registry')?Surface_Identity_Registry::get_statuses():[]; foreach($statuses as $k=>$v){if($k==='available')continue;echo '<option value="'.esc_attr($k).'" '.selected($registry_status,$k,false).'>'.esc_html($v).'</option>';} ?></select></label><button class="soc-btn" type="submit">Filter</button><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg('soc_section','registry',$base_url)); ?>">Reset</a></form><div class="soc-table-wrap"><table class="soc-table"><thead><tr><th>Identity</th><th>Applicant</th><th>Status</th><th>Classification</th><th>Protection</th><th>Assigned Staff</th><th>Updated</th><th>Action</th></tr></thead><tbody><?php if(!$registry_records): ?><tr><td colspan="8" class="soc-empty">No Registry identities found.</td></tr><?php endif; ?><?php foreach($registry_records as $record): $assignee=$record->assigned_user_id?get_user_by('id',(int)$record->assigned_user_id):false; ?><tr><td><strong>/<?php echo esc_html($record->identity_normalized); ?></strong></td><td><?php echo esc_html($record->owner_email ?: $record->reservation_email ?: 'Not available'); ?></td><td><span class="soc-badge"><?php echo esc_html(self::registry_status_label($record->status)); ?></span></td><td><?php echo esc_html(self::registry_class_label($record->classification)); ?></td><td><span class="soc-badge"><?php echo !empty($record->is_protected) ? 'Protected' : 'Not Protected'; ?></span></td><td><?php echo esc_html($assignee?$assignee->display_name:'Unassigned'); ?></td><td><?php echo esc_html($record->last_updated?mysql2date('M j, Y',$record->last_updated):'—'); ?></td><td><a class="soc-btn soc-btn-light" href="<?php echo esc_url(add_query_arg(['soc_section'=>'registry','view_registry'=>$record->id],$base_url)); ?>">View Details</a></td></tr><?php endforeach; ?></tbody></table></div></section>
             <?php endif; ?>
         <?php elseif($section==='partners'): ?>
             <?php
